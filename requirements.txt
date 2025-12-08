@@ -1,0 +1,19 @@
+# Citate Genie Requirements
+# Updated: 2025-12-08 - Added beautifulsoup4 for URL metadata extraction
+
+# Web Framework
+flask>=2.3.0
+gunicorn>=21.0.0
+
+# HTTP Client
+requests>=2.28.0
+
+# Document Processing
+python-docx>=0.8.11
+
+# HTML Parsing (for URL metadata extraction)
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Optional: Better HTML parsing performance
+# html5lib>=1.1
