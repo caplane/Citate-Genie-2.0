@@ -1,1 +1,904 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CiteFlex Unified - Citation Workbench</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <style>
+        /*
+         * CiteFlex Unified - Workbench UI
+         * Version: 1.2.0
+         * Updated: 2025-12-06 12:35
+         * 
+         * V1.2.0 Changes:
+         * - Final Citation box now appears at TOP (was bottom)
+         * - Pre-populates with auto-resolved result from get_citation()
+         * - User sees exactly what will go into document
+         * - Alternative Resolutions below allow override
+         * 
+         * Combines CiteFlex Pro (academic engines) with Cite Fix Pro (legal cache)
+         * into a unified citation management workbench.
+         */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Merriweather:ital,wght@0,300;0,400;0,700;1,300;1,400&display=swap');
+        
+        body { font-family: 'Inter', sans-serif; background-color: #f8fafc; }
+        .serif { font-family: 'Merriweather', serif; }
+        
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
 
+        .loader {
+            border: 3px solid #e2e8f0;
+            border-radius: 50%;
+            border-top: 3px solid #2563eb;
+            width: 20px;
+            height: 20px;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        
+        .animate-fade-in { animation: fadeIn 0.3s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .animate-pulse-once { animation: pulseOnce 0.5s ease-out; }
+        @keyframes pulseOnce { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.02); } }
+        
+        /* Citation type badges */
+        .badge-legal { background: #fef3c7; color: #92400e; }
+        .badge-journal { background: #d1fae5; color: #065f46; }
+        .badge-book { background: #dbeafe; color: #1e40af; }
+        .badge-medical { background: #fce7f3; color: #9d174d; }
+        .badge-interview { background: #e0e7ff; color: #3730a3; }
+        .badge-newspaper { background: #f3e8ff; color: #6b21a8; }
+        .badge-government { background: #fee2e2; color: #991b1b; }
+        .badge-unknown { background: #f1f5f9; color: #475569; }
+        
+        /* Status indicators */
+        .status-pending { border-left: 3px solid #94a3b8; }
+        .status-success { border-left: 3px solid #22c55e; background: #f0fdf4; }
+        .status-error { border-left: 3px solid #ef4444; background: #fef2f2; }
+        .status-active { border-left: 3px solid #3b82f6; background: #eff6ff; }
+        
+        /* Tooltip */
+        .tooltip { position: relative; }
+        .tooltip:hover::after {
+            content: attr(data-tip);
+            position: absolute;
+            bottom: 100%;
+            left: 50%;
+            transform: translateX(-50%);
+            background: #1e293b;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            white-space: nowrap;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body class="h-screen flex flex-col overflow-hidden">
+
+    <!-- Header -->
+    <header class="bg-white border-b border-gray-200 shadow-sm z-20 px-6 h-16 flex items-center justify-between flex-shrink-0">
+        <div class="flex items-center gap-4">
+            <div class="bg-gradient-to-br from-blue-600 to-indigo-600 text-white w-10 h-10 flex items-center justify-center rounded-lg shadow-sm">
+                <i class="fas fa-quote-left text-lg"></i>
+            </div>
+            <div>
+                <h1 class="text-xl font-bold text-gray-900 tracking-tight">CiteFlex <span class="text-blue-600">Unified</span></h1>
+                <p class="text-xs text-gray-500 font-medium">Best-in-Breed Citation Workbench <span id="app-version">v1.3</span></p>
+            </div>
+        </div>
+        
+        <div class="flex items-center gap-3">
+            <div class="hidden md:flex items-center gap-2 text-xs text-gray-500 bg-gray-100 px-3 py-1.5 rounded-full">
+                <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                <span>65 cases cached • 5 styles • 7 types</span>
+            </div>
+            <button onclick="window.location.reload()" class="text-gray-500 hover:text-gray-700 font-medium text-sm px-3 py-2 rounded-lg hover:bg-gray-100 transition-colors">
+                <i class="fas fa-redo mr-1"></i> Reset
+            </button>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-1 flex overflow-hidden">
+        
+        <!-- Left Sidebar: Upload & Citation List -->
+        <aside class="w-80 lg:w-96 bg-white border-r border-gray-200 flex flex-col z-10 flex-shrink-0">
+            
+            <!-- Upload Area -->
+            <div class="p-4 border-b border-gray-100 bg-gradient-to-b from-gray-50 to-white">
+                <input type="file" id="file-input" class="hidden" accept=".docx">
+                <button onclick="document.getElementById('file-input').click()" class="w-full border-2 border-dashed border-gray-300 rounded-xl p-5 text-center hover:border-blue-500 hover:bg-blue-50 transition-all cursor-pointer group flex flex-col items-center gap-2">
+                    <i class="fas fa-cloud-upload-alt text-2xl text-gray-400 group-hover:text-blue-500 transition-colors"></i>
+                    <span class="text-sm font-medium text-gray-600 group-hover:text-blue-700">Upload Document (.docx)</span>
+                    <span class="text-xs text-gray-400">Endnotes & footnotes will be extracted</span>
+                </button>
+                
+                <div id="upload-loading" class="hidden mt-3 flex items-center justify-center gap-2 text-xs text-gray-500">
+                    <div class="loader w-4 h-4"></div> <span>Parsing document structure...</span>
+                </div>
+                
+                <!-- CitateGenie Processing Overlay -->
+                <div id="processing-overlay" class="hidden fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center">
+                    <div class="bg-white rounded-2xl shadow-2xl p-8 max-w-md mx-4 text-center">
+                        <div class="mb-6">
+                            <div class="inline-flex items-center justify-center w-16 h-16 bg-gradient-to-br from-blue-500 to-purple-600 rounded-full mb-4">
+                                <i class="fas fa-magic text-white text-2xl animate-pulse"></i>
+                            </div>
+                            <h3 class="text-xl font-bold text-gray-800">CitateGenie Processing</h3>
+                            <p class="text-gray-500 text-sm mt-1">Analyzing your citations with AI...</p>
+                        </div>
+                        
+                        <div class="space-y-3">
+                            <div id="processing-status" class="text-sm text-gray-600">
+                                <span class="inline-block w-2 h-2 bg-blue-500 rounded-full animate-ping mr-2"></span>
+                                Extracting endnotes and footnotes...
+                            </div>
+                            
+                            <div class="w-full bg-gray-200 rounded-full h-2 overflow-hidden">
+                                <div id="processing-progress" class="bg-gradient-to-r from-blue-500 to-purple-600 h-2 rounded-full transition-all duration-500" style="width: 10%"></div>
+                            </div>
+                            
+                            <p class="text-xs text-gray-400 mt-4">
+                                This may take a moment for complex citations
+                            </p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div id="file-info" class="hidden mt-3 flex items-center justify-between bg-blue-50 px-3 py-2 rounded-lg">
+                    <span class="text-sm text-blue-700 font-medium truncate" id="file-name-display"></span>
+                    <button onclick="resetDocument()" class="text-blue-600 hover:text-blue-800 text-xs">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                
+                <div id="download-area" class="hidden mt-3">
+                    <button onclick="downloadDocument()" class="w-full bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white font-medium py-2.5 px-4 rounded-lg transition-all text-sm shadow-sm flex items-center justify-center gap-2">
+                        <i class="fas fa-file-download"></i> Download Processed Document
+                    </button>
+                </div>
+            </div>
+
+            <!-- Stats Bar -->
+            <div class="px-4 py-2 bg-white border-b border-gray-100 flex justify-between items-center">
+                <span class="text-xs font-bold text-gray-400 uppercase tracking-wider">Citations</span>
+                <div class="flex items-center gap-2">
+                    <span id="success-count" class="hidden text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full font-medium">0 done</span>
+                    <span id="citation-count" class="text-xs bg-gray-100 px-2 py-1 rounded text-gray-600 font-medium">0 total</span>
+                </div>
+            </div>
+
+            <!-- Citation List -->
+            <div id="citation-list" class="flex-1 overflow-y-auto">
+                <div id="list-empty" class="text-center py-12 text-gray-400">
+                    <i class="fas fa-inbox text-4xl mb-3 opacity-30"></i>
+                    <p class="text-sm font-medium">Upload a document to begin</p>
+                    <p class="text-xs mt-1">Endnotes and footnotes will appear here</p>
+                </div>
+            </div>
+            
+            <!-- Quick Lookup (always visible) -->
+            <div class="p-4 border-t border-gray-200 bg-gray-50">
+                <div class="flex gap-2">
+                    <input type="text" id="quick-query" placeholder="Quick lookup: title, case, DOI..." 
+                           class="flex-1 text-sm px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none">
+                    <button onclick="quickLookup()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors">
+                        <i class="fas fa-search"></i>
+                    </button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Editor Panel -->
+        <section id="editor-panel" class="flex-1 bg-gray-50 flex flex-col overflow-hidden">
+            
+            <!-- Empty State -->
+            <div id="editor-empty" class="flex flex-col items-center justify-center h-full text-gray-400">
+                <i class="fas fa-mouse-pointer text-5xl mb-4 opacity-20"></i>
+                <p class="text-lg font-medium">Select a citation to resolve</p>
+                <p class="text-sm mt-1">Or use quick lookup below the list</p>
+            </div>
+
+            <!-- Active Editor -->
+            <div id="editor-active" class="hidden flex-1 overflow-y-auto p-6 lg:p-8">
+                <div class="max-w-4xl mx-auto w-full space-y-6 animate-fade-in">
+                    
+                    <!-- Original Text Card -->
+                    <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-200">
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
+                                <i class="fas fa-file-alt text-gray-300"></i> Original Citation
+                            </h3>
+                            <div class="flex items-center gap-2">
+                                <span id="active-type" class="text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-unknown">detecting...</span>
+                                <span id="active-id" class="text-xs font-mono text-gray-400">Note #</span>
+                            </div>
+                        </div>
+                        <div id="active-original" class="text-gray-800 serif italic p-4 bg-gradient-to-br from-gray-50 to-slate-50 rounded-lg border border-gray-100 leading-relaxed text-lg"></div>
+                    </div>
+
+                    <!-- Final Editor (moved to top - shows auto-resolved result) -->
+                    <div class="bg-white p-6 rounded-xl shadow-sm border-2 border-blue-200 ring-2 ring-blue-50">
+                        <h3 class="text-xs font-bold text-blue-600 uppercase mb-3 flex items-center gap-2">
+                            <i class="fas fa-pen-nib"></i> Final Citation
+                            <span class="text-[10px] font-normal text-gray-400 ml-2">(auto-resolved — edit or select alternative below)</span>
+                        </h3>
+                        <textarea id="final-edit-area" class="w-full p-4 border border-gray-300 rounded-lg serif text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none resize-y min-h-[120px] leading-relaxed" placeholder="Auto-resolved citation will appear here..."></textarea>
+                        
+                        <div class="flex gap-3 mt-4 pt-4 border-t border-gray-100">
+                            <button onclick="commitChange()" id="commit-btn" class="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-medium py-3 rounded-lg transition-all shadow-sm flex items-center justify-center gap-2">
+                                <i class="fas fa-check"></i> Accept & Save
+                            </button>
+                            <button onclick="copyToClipboard()" class="px-5 py-3 bg-white text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors border border-gray-200 shadow-sm flex items-center gap-2 tooltip" data-tip="Copy to clipboard">
+                                <i class="fas fa-copy text-gray-400"></i>
+                            </button>
+                            <button onclick="appendMode()" class="px-5 py-3 bg-white text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors border border-gray-200 shadow-sm flex items-center gap-2 tooltip" data-tip="Append another source">
+                                <i class="fas fa-plus text-gray-400"></i>
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Candidates Section (alternatives below) -->
+                    <div id="candidates-section">
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
+                                <i class="fas fa-magic text-gray-300"></i> Alternative Resolutions
+                            </h3>
+                            
+                            <div class="flex items-center gap-2">
+                                <select id="style-selector" onchange="searchCandidates()" class="text-xs border border-gray-300 rounded-lg bg-white text-gray-600 h-8 px-3 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none cursor-pointer">
+                                    <option value="Chicago Manual of Style">Chicago (17th)</option>
+                                    <option value="Bluebook">Bluebook (Legal)</option>
+                                    <option value="OSCOLA">OSCOLA (UK)</option>
+                                    <option value="APA">APA (7th)</option>
+                                    <option value="MLA">MLA (9th)</option>
+                                </select>
+                                
+                                <button onclick="searchCandidates()" class="text-xs text-blue-600 font-medium hover:bg-blue-50 p-2 rounded-lg transition-colors tooltip" data-tip="Refresh results">
+                                    <i class="fas fa-sync-alt"></i>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <div id="candidates-list" class="space-y-3">
+                            <!-- Candidates will be inserted here -->
+                        </div>
+                    </div>
+                    
+                    <!-- Navigation -->
+                    <div class="flex justify-between items-center pt-2">
+                        <button onclick="navigateCitation(-1)" id="prev-btn" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed">
+                            <i class="fas fa-arrow-left"></i> Previous
+                        </button>
+                        <span id="nav-position" class="text-xs text-gray-400">1 of 10</span>
+                        <button onclick="navigateCitation(1)" id="next-btn" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed">
+                            Next <i class="fas fa-arrow-right"></i>
+                        </button>
+                    </div>
+
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script>
+        /*
+         * CiteFlex Unified - Frontend Logic
+         * Version: 1.2.0
+         * Updated: 2025-12-06 12:35
+         */
+        
+        let currentCitations = [];
+        let activeNoteId = null;
+        let activeNoteIndex = -1;
+        let sessionId = null;
+        let successCount = 0;
+
+        // Fetch app version from server
+        fetch('/api/version')
+            .then(r => r.json())
+            .then(data => {
+                if (data.version) {
+                    document.getElementById('app-version').textContent = 'v' + data.version;
+                }
+            })
+            .catch(() => {}); // Silently fail if endpoint unavailable
+
+        // ========== FILE UPLOAD ==========
+        document.getElementById('file-input').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const loading = document.getElementById('upload-loading');
+            const fileInfo = document.getElementById('file-info');
+            const overlay = document.getElementById('processing-overlay');
+            const status = document.getElementById('processing-status');
+            const progress = document.getElementById('processing-progress');
+            
+            // Show processing overlay immediately
+            overlay.classList.remove('hidden');
+            loading.classList.remove('hidden');
+            fileInfo.classList.add('hidden');
+            
+            // Animate progress and status messages
+            let progressValue = 10;
+            const statusMessages = [
+                { pct: 10, msg: 'Extracting endnotes and footnotes...' },
+                { pct: 25, msg: 'Analyzing citation patterns...' },
+                { pct: 40, msg: 'Searching academic databases...' },
+                { pct: 55, msg: 'Verifying with PubMed & Crossref...' },
+                { pct: 70, msg: 'Resolving ambiguous references...' },
+                { pct: 85, msg: 'Formatting citations...' },
+            ];
+            let msgIndex = 0;
+            
+            const progressInterval = setInterval(() => {
+                if (msgIndex < statusMessages.length) {
+                    const target = statusMessages[msgIndex].pct;
+                    if (progressValue < target) {
+                        progressValue += 2;
+                        progress.style.width = progressValue + '%';
+                    } else {
+                        status.innerHTML = `<span class="inline-block w-2 h-2 bg-blue-500 rounded-full animate-ping mr-2"></span>${statusMessages[msgIndex].msg}`;
+                        msgIndex++;
+                    }
+                }
+            }, 300);
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            formData.append('style', document.getElementById('style-selector').value);
+            
+            try {
+                const res = await fetch('/api/process', { method: 'POST', body: formData });
+                const data = await res.json();
+                
+                clearInterval(progressInterval);
+                progress.style.width = '100%';
+                status.innerHTML = '<span class="inline-block w-2 h-2 bg-green-500 rounded-full mr-2"></span>Complete!';
+                
+                // Brief pause to show completion
+                await new Promise(r => setTimeout(r, 500));
+                
+                if (data.success) {
+                    sessionId = data.session_id;
+                    currentCitations = data.notes || [];
+                    successCount = 0;
+                    
+                    document.getElementById('citation-count').innerText = `${currentCitations.length} total`;
+                    document.getElementById('file-name-display').innerText = file.name;
+                    fileInfo.classList.remove('hidden');
+                    document.getElementById('download-area').classList.remove('hidden');
+                    
+                    renderCitationList();
+                    
+                    // Auto-select first if available
+                    if (currentCitations.length > 0) {
+                        loadEditor(currentCitations[0], 0);
+                    }
+                } else {
+                    alert('Error: ' + (data.error || 'Failed to process document'));
+                }
+            } catch (err) {
+                clearInterval(progressInterval);
+                console.error(err);
+                alert('Upload failed: ' + err.message);
+            } finally {
+                loading.classList.add('hidden');
+                overlay.classList.add('hidden');
+                // Reset progress for next upload
+                progress.style.width = '10%';
+                status.innerHTML = '<span class="inline-block w-2 h-2 bg-blue-500 rounded-full animate-ping mr-2"></span>Extracting endnotes and footnotes...';
+            }
+        });
+
+        function resetDocument() {
+            currentCitations = [];
+            activeNoteId = null;
+            activeNoteIndex = -1;
+            sessionId = null;
+            successCount = 0;
+            
+            document.getElementById('file-info').classList.add('hidden');
+            document.getElementById('download-area').classList.add('hidden');
+            document.getElementById('citation-count').innerText = '0 total';
+            document.getElementById('success-count').classList.add('hidden');
+            document.getElementById('list-empty').classList.remove('hidden');
+            document.getElementById('citation-list').innerHTML = `
+                <div id="list-empty" class="text-center py-12 text-gray-400">
+                    <i class="fas fa-inbox text-4xl mb-3 opacity-30"></i>
+                    <p class="text-sm font-medium">Upload a document to begin</p>
+                </div>`;
+            document.getElementById('editor-empty').classList.remove('hidden');
+            document.getElementById('editor-active').classList.add('hidden');
+            document.getElementById('file-input').value = '';
+        }
+
+        // ========== CITATION LIST ==========
+        function renderCitationList() {
+            const list = document.getElementById('citation-list');
+            list.innerHTML = '';
+            
+            if (currentCitations.length === 0) {
+                list.innerHTML = `
+                    <div class="text-center py-12 text-gray-400">
+                        <i class="fas fa-inbox text-4xl mb-3 opacity-30"></i>
+                        <p class="text-sm font-medium">No citations found</p>
+                    </div>`;
+                return;
+            }
+            
+            currentCitations.forEach((note, index) => {
+                const div = document.createElement('div');
+                div.id = `list-item-${note.id}`;
+                div.className = 'px-4 py-3 border-b border-gray-100 cursor-pointer hover:bg-blue-50 transition-all status-pending';
+                div.onclick = () => loadEditor(note, index);
+                
+                const truncatedText = note.text.length > 80 ? note.text.substring(0, 80) + '...' : note.text;
+                
+                div.innerHTML = `
+                    <div class="flex items-start gap-3">
+                        <span class="text-xs font-mono text-gray-400 mt-1">${note.id}</span>
+                        <div class="flex-1 min-w-0">
+                            <p class="text-sm text-gray-700 serif leading-relaxed truncate">${truncatedText}</p>
+                        </div>
+                    </div>
+                `;
+                list.appendChild(div);
+            });
+        }
+
+        // ========== EDITOR ==========
+        function loadEditor(note, index) {
+            activeNoteId = note.id;
+            activeNoteIndex = index;
+            
+            // Update list selection
+            document.querySelectorAll('#citation-list > div').forEach(el => {
+                el.classList.remove('status-active', 'bg-blue-50');
+            });
+            const activeItem = document.getElementById(`list-item-${note.id}`);
+            if (activeItem && !activeItem.classList.contains('status-success')) {
+                activeItem.classList.add('status-active');
+            }
+            
+            // Show editor
+            document.getElementById('editor-empty').classList.add('hidden');
+            document.getElementById('editor-active').classList.remove('hidden');
+            
+            // Populate fields
+            document.getElementById('active-id').innerText = `Note #${note.id}`;
+            document.getElementById('active-original').innerText = note.text;
+            
+            // Pre-populate Final Citation with the auto-resolved result
+            // This shows what will go into the document unless user overrides
+            document.getElementById('final-edit-area').value = note.formatted || '';
+            
+            // Mark ibid/short as already done since they're rule-based
+            if (note.form === 'ibid' || note.form === 'short') {
+                if (note.success) {
+                    const listItem = document.getElementById(`list-item-${note.id}`);
+                    if (listItem && !listItem.classList.contains('status-success')) {
+                        listItem.classList.remove('status-pending', 'status-active');
+                        listItem.classList.add('status-success');
+                        listItem.querySelector('p').innerHTML = `<i class="fas fa-check text-green-500 mr-1"></i>${(note.formatted || '').substring(0, 70)}...`;
+                    }
+                }
+            }
+            
+            // Update type badge
+            const typeBadge = document.getElementById('active-type');
+            const type = note.type || 'unknown';
+            typeBadge.innerText = type;
+            typeBadge.className = `text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-${type}`;
+            
+            // Show navigation
+            document.getElementById('prev-btn').classList.remove('hidden');
+            document.getElementById('next-btn').classList.remove('hidden');
+            
+            // Update navigation
+            updateNavigation();
+            
+            // Search for candidates
+            searchCandidates();
+        }
+
+        function updateNavigation() {
+            document.getElementById('nav-position').innerText = `${activeNoteIndex + 1} of ${currentCitations.length}`;
+            document.getElementById('prev-btn').disabled = activeNoteIndex <= 0;
+            document.getElementById('next-btn').disabled = activeNoteIndex >= currentCitations.length - 1;
+        }
+
+        function navigateCitation(direction) {
+            const newIndex = activeNoteIndex + direction;
+            if (newIndex >= 0 && newIndex < currentCitations.length) {
+                loadEditor(currentCitations[newIndex], newIndex);
+            }
+        }
+
+        // ========== CANDIDATE SEARCH ==========
+        async function searchCandidates() {
+            const text = document.getElementById('active-original').innerText;
+            if (!text) return;
+            
+            const style = document.getElementById('style-selector').value;
+            const list = document.getElementById('candidates-list');
+            
+            list.innerHTML = `
+                <div class="flex items-center justify-center py-10 gap-3 text-gray-400">
+                    <div class="loader"></div>
+                    <span class="text-sm">Searching all engines...</span>
+                </div>
+            `;
+            
+            try {
+                // Call /api/cite/multiple to get results from ALL engines
+                const res = await fetch('/api/cite/multiple', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ query: text, style: style, limit: 6 })
+                });
+                const data = await res.json();
+                
+                if (data.success && data.results && data.results.length > 0) {
+                    // Prepend original text as first option (safety fallback)
+                    const originalOption = {
+                        citation: text,
+                        type: 'original',
+                        source: 'Your Note',
+                        confidence: 'original',
+                        isOriginal: true
+                    };
+                    renderCandidates([originalOption, ...data.results]);
+                    
+                    // Update type badge from first result
+                    const firstResult = data.results[0];
+                    if (firstResult.type) {
+                        const typeBadge = document.getElementById('active-type');
+                        typeBadge.innerText = firstResult.type;
+                        typeBadge.className = `text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-${firstResult.type}`;
+                    }
+                    
+                    // Do NOT auto-fill editor - let user choose
+                } else {
+                    // No API results, but still show original as option
+                    const originalOption = {
+                        citation: text,
+                        type: 'original',
+                        source: 'Your Note',
+                        confidence: 'original',
+                        isOriginal: true
+                    };
+                    renderCandidates([originalOption]);
+                    
+                    // Add message about no matches
+                    const noMatchMsg = document.createElement('div');
+                    noMatchMsg.className = 'text-center py-4 text-gray-400 border-t border-gray-100 mt-4';
+                    noMatchMsg.innerHTML = `
+                        <i class="fas fa-search text-xl mb-2 opacity-30"></i>
+                        <p class="text-xs">${data.error || 'No additional matches found'}</p>
+                    `;
+                    list.appendChild(noMatchMsg);
+                }
+            } catch (err) {
+                console.error(err);
+                list.innerHTML = `
+                    <div class="text-center py-8 text-red-400">
+                        <i class="fas fa-exclamation-triangle text-2xl mb-2"></i>
+                        <p class="text-sm">Search failed</p>
+                    </div>
+                `;
+            }
+        }
+
+        function renderCandidates(results) {
+            const list = document.getElementById('candidates-list');
+            list.innerHTML = '';
+            
+            if (!results || results.length === 0) {
+                list.innerHTML = `
+                    <div class="text-center py-8 text-gray-400">
+                        <i class="fas fa-search text-2xl mb-2 opacity-30"></i>
+                        <p class="text-sm">No matches found</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            results.forEach((cand, index) => {
+                const item = document.createElement('div');
+                item.className = 'bg-white p-4 rounded-xl border border-gray-200 hover:border-blue-400 hover:shadow-md cursor-pointer group transition-all';
+                
+                // Click to select this candidate and fill editor
+                item.onclick = () => {
+                    document.getElementById('final-edit-area').value = cand.citation || cand.formatted;
+                    
+                    // Visual feedback - highlight selected
+                    document.querySelectorAll('#candidates-list > div').forEach(el => {
+                        el.classList.remove('border-blue-400', 'bg-blue-50', 'ring-2', 'ring-blue-200');
+                    });
+                    item.classList.add('border-blue-400', 'bg-blue-50', 'ring-2', 'ring-blue-200');
+                };
+                
+                // Special styling for original note
+                const isOriginal = cand.isOriginal === true;
+                const badgeClass = isOriginal ? 'bg-gray-700 text-white' : `badge-${cand.type || 'unknown'}`;
+                const badgeText = isOriginal ? 'ORIGINAL' : (cand.type || 'result');
+                const sourceText = isOriginal ? 'Your Note' : (cand.source || 'engine');
+                
+                const confidenceIcon = cand.confidence === 'high' 
+                    ? '<i class="fas fa-star text-amber-400 text-xs" title="High Confidence"></i>'
+                    : cand.confidence === 'medium'
+                    ? '<i class="fas fa-check-circle text-green-400 text-xs" title="Medium Confidence"></i>'
+                    : cand.confidence === 'original'
+                    ? '<i class="fas fa-file-alt text-gray-400 text-xs" title="Original Text"></i>'
+                    : '';
+                
+                const displayText = formatDisplayHtml(cand.citation || cand.formatted || '');
+                
+                // Add helper text for original
+                const helperText = isOriginal 
+                    ? '<p class="text-xs text-gray-500 mt-2 italic"><i class="fas fa-info-circle mr-1"></i>Select if none of the alternatives match your source</p>'
+                    : '';
+                
+                item.innerHTML = `
+                    <div class="flex justify-between items-start mb-2">
+                        <div class="flex items-center gap-2">
+                            <span class="text-[10px] font-bold uppercase px-2 py-0.5 rounded ${badgeClass}">${badgeText}</span>
+                            <span class="text-[10px] text-gray-400 font-medium">${sourceText}</span>
+                            ${confidenceIcon}
+                        </div>
+                        <button class="text-xs font-medium text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity bg-white px-2 py-1 rounded border border-blue-100 shadow-sm">
+                            Use This <i class="fas fa-arrow-down ml-1"></i>
+                        </button>
+                    </div>
+                    <p class="text-sm serif text-gray-800 leading-relaxed">${displayText}</p>
+                    ${helperText}
+                `;
+                list.appendChild(item);
+            });
+        }
+
+        function formatDisplayHtml(text) {
+            // Convert <i> tags to <em> for display
+            return text.replace(/<i>/g, '<em>').replace(/<\/i>/g, '</em>');
+        }
+
+        // ========== COMMIT CHANGES ==========
+        async function commitChange() {
+            const newText = document.getElementById('final-edit-area').value;
+            const btn = document.getElementById('commit-btn');
+            const originalHtml = btn.innerHTML;
+            
+            if (!newText.trim()) {
+                alert('Please enter or select a citation first.');
+                return;
+            }
+            
+            // For quick lookup (no document), just copy to clipboard
+            if (!activeNoteId || !sessionId) {
+                await navigator.clipboard.writeText(newText);
+                btn.innerHTML = `<i class="fas fa-copy"></i> Copied!`;
+                setTimeout(() => { btn.innerHTML = originalHtml; }, 1500);
+                return;
+            }
+            
+            btn.innerHTML = `<div class="loader w-5 h-5 border-white border-t-transparent"></div>`;
+            btn.disabled = true;
+            
+            // Disable navigation while saving to prevent race conditions
+            document.getElementById('prev-btn').disabled = true;
+            document.getElementById('next-btn').disabled = true;
+            document.getElementById('prev-btn').classList.add('opacity-50', 'cursor-not-allowed');
+            document.getElementById('next-btn').classList.add('opacity-50', 'cursor-not-allowed');
+            
+            // Always update local state first (resilient to server issues)
+            const listItem = document.getElementById(`list-item-${activeNoteId}`);
+            if (currentCitations[activeNoteIndex]) {
+                currentCitations[activeNoteIndex].formatted = newText;
+            }
+            
+            try {
+                const res = await fetch('/api/update', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ 
+                        session_id: sessionId,
+                        note_id: activeNoteId, 
+                        html: newText 
+                    })
+                });
+                const data = await res.json();
+                
+                if (data.success) {
+                    markNoteSuccess(listItem, newText, btn, originalHtml);
+                } else {
+                    throw new Error(data.error || 'Save failed');
+                }
+            } catch (err) {
+                console.warn('Server save failed:', err.message);
+                
+                // Session expired - copy to clipboard and mark locally anyway
+                await navigator.clipboard.writeText(newText);
+                
+                // Still mark as "done" locally so user can continue working
+                if (listItem) {
+                    listItem.classList.remove('status-pending', 'status-active');
+                    listItem.classList.add('status-success');
+                    listItem.querySelector('p').innerHTML = `<i class="fas fa-clipboard text-blue-500 mr-1"></i>${newText.substring(0, 70)}...`;
+                }
+                
+                successCount++;
+                const countEl = document.getElementById('success-count');
+                countEl.innerText = `${successCount} done`;
+                countEl.classList.remove('hidden');
+                
+                btn.innerHTML = `<i class="fas fa-clipboard"></i> Copied!`;
+                btn.classList.remove('from-blue-600', 'to-indigo-600');
+                btn.classList.add('from-yellow-500', 'to-amber-500');
+                
+                // Show brief warning
+                showToast('Session expired - citation copied to clipboard. Re-upload document to save to file.');
+                
+                setTimeout(() => {
+                    btn.innerHTML = originalHtml;
+                    btn.classList.remove('from-yellow-500', 'to-amber-500');
+                    btn.classList.add('from-blue-600', 'to-indigo-600');
+                    btn.disabled = false;
+                    
+                    // Re-enable navigation
+                    document.getElementById('prev-btn').disabled = false;
+                    document.getElementById('next-btn').disabled = false;
+                    document.getElementById('prev-btn').classList.remove('opacity-50', 'cursor-not-allowed');
+                    document.getElementById('next-btn').classList.remove('opacity-50', 'cursor-not-allowed');
+                    
+                    if (activeNoteIndex < currentCitations.length - 1) {
+                        navigateCitation(1);
+                    }
+                }, 1500);
+                return;
+            }
+        }
+        
+        function markNoteSuccess(listItem, newText, btn, originalHtml) {
+            if (listItem) {
+                listItem.classList.remove('status-pending', 'status-active');
+                listItem.classList.add('status-success');
+                listItem.querySelector('p').innerHTML = `<i class="fas fa-check text-green-500 mr-1"></i>${newText.substring(0, 70)}...`;
+            }
+            
+            successCount++;
+            const countEl = document.getElementById('success-count');
+            countEl.innerText = `${successCount} done`;
+            countEl.classList.remove('hidden');
+            
+            btn.innerHTML = `<i class="fas fa-check"></i> Saved!`;
+            btn.classList.remove('from-blue-600', 'to-indigo-600');
+            btn.classList.add('from-green-600', 'to-emerald-600');
+            
+            setTimeout(() => {
+                btn.innerHTML = originalHtml;
+                btn.classList.remove('from-green-600', 'to-emerald-600');
+                btn.classList.add('from-blue-600', 'to-indigo-600');
+                btn.disabled = false;
+                
+                // Re-enable navigation
+                document.getElementById('prev-btn').disabled = false;
+                document.getElementById('next-btn').disabled = false;
+                document.getElementById('prev-btn').classList.remove('opacity-50', 'cursor-not-allowed');
+                document.getElementById('next-btn').classList.remove('opacity-50', 'cursor-not-allowed');
+                
+                if (activeNoteIndex < currentCitations.length - 1) {
+                    navigateCitation(1);
+                }
+            }, 1000);
+        }
+        
+        function showToast(message) {
+            const toast = document.createElement('div');
+            toast.className = 'fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-gray-900 text-white px-4 py-2 rounded-lg shadow-lg text-sm z-50 animate-fade-in';
+            toast.innerText = message;
+            document.body.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
+        }
+
+        // ========== UTILITIES ==========
+        function appendMode() {
+            const area = document.getElementById('final-edit-area');
+            area.value = area.value.trim() + "; ";
+            area.focus();
+            area.setSelectionRange(area.value.length, area.value.length);
+        }
+
+        function copyToClipboard() {
+            const text = document.getElementById('final-edit-area').value;
+            navigator.clipboard.writeText(text).then(() => {
+                // Visual feedback
+                const btn = event.currentTarget;
+                const icon = btn.querySelector('i');
+                icon.className = 'fas fa-check text-green-500';
+                setTimeout(() => {
+                    icon.className = 'fas fa-copy text-gray-400';
+                }, 1000);
+            });
+        }
+
+        async function downloadDocument() {
+            if (!sessionId) {
+                showToast('No document loaded. Upload a document first.');
+                return;
+            }
+            
+            try {
+                const res = await fetch(`/api/download/${sessionId}`, { method: 'HEAD' });
+                if (res.ok) {
+                    window.location.href = `/api/download/${sessionId}`;
+                } else {
+                    showToast('Session expired. Please re-upload your document to download.');
+                }
+            } catch (err) {
+                // If HEAD fails, try direct download anyway
+                window.location.href = `/api/download/${sessionId}`;
+            }
+        }
+
+        // ========== QUICK LOOKUP ==========
+        async function quickLookup() {
+            const query = document.getElementById('quick-query').value.trim();
+            if (!query) return;
+            
+            const style = document.getElementById('style-selector').value;
+            
+            // Show editor with this query
+            document.getElementById('editor-empty').classList.add('hidden');
+            document.getElementById('editor-active').classList.remove('hidden');
+            document.getElementById('active-id').innerText = 'Quick Lookup';
+            document.getElementById('active-original').innerText = query;
+            document.getElementById('final-edit-area').value = '';
+            document.getElementById('active-type').innerText = 'searching...';
+            document.getElementById('active-type').className = 'text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-unknown';
+            
+            activeNoteId = null;
+            activeNoteIndex = -1;
+            
+            // Hide navigation for quick lookup
+            document.getElementById('prev-btn').classList.add('hidden');
+            document.getElementById('next-btn').classList.add('hidden');
+            document.getElementById('nav-position').innerText = 'Quick Lookup';
+            
+            await searchCandidates();
+        }
+
+        // Enter key for quick lookup
+        document.getElementById('quick-query').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                quickLookup();
+            }
+        });
+
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            // Ctrl/Cmd + Enter to save
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+                e.preventDefault();
+                commitChange();
+            }
+            // Arrow keys for navigation (when not in textarea)
+            if (e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'INPUT') {
+                if (e.key === 'ArrowLeft') navigateCitation(-1);
+                if (e.key === 'ArrowRight') navigateCitation(1);
+            }
+        });
+    </script>
+</body>
+</html>
