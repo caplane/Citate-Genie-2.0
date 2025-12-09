@@ -1401,7 +1401,7 @@ def _has_good_url_metadata(result: CitationMetadata, url: str) -> bool:
     if not result:
         return False
     
-    # Check title is not just domain name
+    # Check title is not just domain name or publication name
     if not result.title:
         return False
     
@@ -1409,19 +1409,35 @@ def _has_good_url_metadata(result: CitationMetadata, url: str) -> bool:
         from urllib.parse import urlparse
         parsed = urlparse(url)
         domain = parsed.netloc.lower().replace('www.', '')
-        domain_base = domain.split('.')[0]
+        domain_base = domain.split('.')[0]  # e.g., "theatlantic" from "theatlantic.com"
     except:
         return True  # Can't parse, assume OK
     
     title_lower = result.title.lower().strip()
+    title_no_spaces = title_lower.replace(' ', '').replace('-', '')
     
-    # Title is just the domain
+    # Title is just the domain (with or without spaces)
+    # e.g., "The Atlantic" matches "theatlantic"
     if title_lower == domain or title_lower == domain_base:
         return False
-    
-    # Title is very short
-    if len(result.title) < 5:
+    if title_no_spaces == domain_base or title_no_spaces == domain.replace('.', ''):
         return False
+    
+    # Title is very short (likely just a site name)
+    if len(result.title) < 10:
+        return False
+    
+    # FIX 2025-12-09: For newspaper URLs, we need both title AND author
+    # Just having the publication name is not enough
+    if result.citation_type == CitationType.NEWSPAPER:
+        has_author = result.authors and len(result.authors) > 0
+        # If no author and title looks like publication name, it's minimal
+        if not has_author:
+            # Common publication name patterns
+            pub_names = ['atlantic', 'new yorker', 'guardian', 'times', 'post', 
+                         'journal', 'tribune', 'chronicle', 'herald', 'news']
+            if any(pub in title_lower for pub in pub_names) and len(result.title) < 30:
+                return False
     
     return True
 
