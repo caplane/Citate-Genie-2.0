@@ -640,7 +640,23 @@ class URLRouter:
             engine = self._engines.get(URLType.NEWSPAPER)
             if engine:
                 print(f"[URLRouter] Using NewspaperEngine")
-                return engine.fetch_by_url(url)
+                result = engine.fetch_by_url(url)
+                
+                # FIX 2025-12-09: Check if result has meaningful data
+                if result:
+                    has_good_title = result.title and not self._is_minimal_title(result.title, url)
+                    has_author = result.authors and len(result.authors) > 0
+                    
+                    if has_good_title and has_author:
+                        return result
+                    
+                    # Try Claude fallback for missing data
+                    print(f"[URLRouter] NewspaperEngine returned minimal data, trying Claude...")
+                    claude_result = self._claude_url_lookup(url, CitationType.NEWSPAPER)
+                    if claude_result:
+                        return claude_result
+                    
+                    return result  # Return whatever we got
             else:
                 print(f"[URLRouter] NewspaperEngine not available, falling back to generic")
                 return self._fallback_generic(url, CitationType.NEWSPAPER)
@@ -649,7 +665,22 @@ class URLRouter:
             engine = self._engines.get(URLType.GOVERNMENT)
             if engine:
                 print(f"[URLRouter] Using GovernmentEngine")
-                return engine.fetch_by_url(url)
+                result = engine.fetch_by_url(url)
+                
+                # FIX 2025-12-09: Check if result has meaningful data
+                if result:
+                    has_good_title = result.title and not self._is_minimal_title(result.title, url)
+                    
+                    if has_good_title:
+                        return result
+                    
+                    # Try Claude fallback for missing data
+                    print(f"[URLRouter] GovernmentEngine returned minimal data, trying Claude...")
+                    claude_result = self._claude_url_lookup(url, CitationType.GOVERNMENT)
+                    if claude_result:
+                        return claude_result
+                    
+                    return result  # Return whatever we got
             else:
                 print(f"[URLRouter] GovernmentEngine not available, falling back to generic")
                 return self._fallback_generic(url, CitationType.GOVERNMENT)
@@ -690,14 +721,36 @@ class URLRouter:
         Fallback to generic URL scraping.
         
         Uses GenericURLEngine if available, otherwise returns minimal metadata.
+        
+        FIX 2025-12-09: Added Claude fallback when scraping returns minimal data.
         """
         engine = self._engines.get(URLType.GENERIC)
+        result = None
+        
         if engine:
             print(f"[URLRouter] Using GenericURLEngine")
             result = engine.fetch_by_url(url)
             if result:
                 result.citation_type = citation_type
-                return result
+                
+                # Check if result has meaningful data
+                has_good_title = result.title and not self._is_minimal_title(result.title, url)
+                has_author = result.authors and len(result.authors) > 0
+                
+                if has_good_title and has_author:
+                    return result
+                
+                # GenericURLEngine returned minimal data, try Claude fallback
+                print(f"[URLRouter] GenericURLEngine returned minimal data, trying Claude...")
+        
+        # Try Claude-based metadata extraction
+        claude_result = self._claude_url_lookup(url, citation_type)
+        if claude_result:
+            return claude_result
+        
+        # Return whatever we got from GenericURLEngine, or minimal metadata
+        if result:
+            return result
         
         # Last resort: return minimal metadata with just the URL
         print(f"[URLRouter] No engine available, returning minimal metadata")
@@ -708,6 +761,122 @@ class URLRouter:
             url=url,
             title="",  # Will need to be filled by user or formatter
         )
+    
+    def _is_minimal_title(self, title: str, url: str) -> bool:
+        """Check if title is just a domain name or other minimal placeholder."""
+        if not title:
+            return True
+        
+        title_lower = title.lower().strip()
+        
+        # Extract domain from URL
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower().replace('www.', '')
+            domain_base = domain.split('.')[0]  # e.g., "theatlantic" from "theatlantic.com"
+        except:
+            return False
+        
+        # Check if title is just the domain
+        if title_lower == domain or title_lower == domain_base or title_lower == domain_base + '.com':
+            return True
+        
+        # Check if title is too short to be meaningful
+        if len(title) < 5:
+            return True
+        
+        return False
+    
+    def _claude_url_lookup(self, url: str, citation_type: CitationType) -> Optional[CitationMetadata]:
+        """
+        Use Claude to identify what a URL points to.
+        
+        This is a fallback when web scraping fails (blocked, JS-rendered, etc.).
+        Claude may know about published articles based on its training data.
+        """
+        try:
+            from claude_router import _get_client, CLAUDE_MODEL
+        except ImportError:
+            print(f"[URLRouter] Claude router not available")
+            return None
+        
+        client = _get_client()
+        if not client:
+            return None
+        
+        try:
+            print(f"[URLRouter] Asking Claude about URL: {url[:60]}...")
+            
+            prompt = f"""Identify this URL and provide citation metadata. The URL is:
+{url}
+
+If you recognize this URL or know what article/document it points to, provide the metadata.
+If this is a newspaper/magazine article, include the author's name if known.
+If this is a government document, include the issuing agency and country.
+
+Respond in JSON format:
+{{
+    "title": "Full article/document title",
+    "authors": ["Author Name"],  // List of authors, empty if unknown
+    "date": "YYYY-MM-DD or Month DD, YYYY",  // Publication date if known
+    "publication": "Publication name",  // Newspaper, journal, agency, etc.
+    "country": "Country",  // For government documents
+    "type": "newspaper|government|article|unknown",
+    "confidence": 0.0-1.0
+}}
+
+If you don't recognize this URL, set confidence to 0."""
+
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            text = response.content[0].text.strip()
+            
+            # Parse JSON response
+            import json
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                data = json.loads(json_match.group())
+                
+                if data.get('confidence', 0) < 0.5:
+                    print(f"[URLRouter] Claude low confidence: {data.get('confidence')}")
+                    return None
+                
+                print(f"[URLRouter] Claude identified: {data.get('title', '')[:50]}...")
+                
+                # Build CitationMetadata from Claude's response
+                from datetime import datetime
+                access_date = datetime.now().strftime('%B %d, %Y').replace(' 0', ' ')
+                
+                # Determine citation type from Claude's response
+                url_type = data.get('type', 'unknown')
+                if url_type == 'newspaper':
+                    final_type = CitationType.NEWSPAPER
+                elif url_type == 'government':
+                    final_type = CitationType.GOVERNMENT
+                else:
+                    final_type = citation_type
+                
+                return CitationMetadata(
+                    citation_type=final_type,
+                    raw_source=url,
+                    source_engine="Claude URL Lookup",
+                    url=url,
+                    title=data.get('title', ''),
+                    authors=data.get('authors', []),
+                    date=data.get('date', ''),
+                    newspaper=data.get('publication', '') if url_type == 'newspaper' else None,
+                    agency=data.get('publication', '') if url_type == 'government' else None,
+                    access_date=access_date,
+                )
+                
+        except Exception as e:
+            print(f"[URLRouter] Claude lookup error: {e}")
+        
+        return None
 
 
 # =============================================================================
