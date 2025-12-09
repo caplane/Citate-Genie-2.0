@@ -15,6 +15,9 @@ Version History:
     2025-12-05 12:53: Enhanced IBID_PATTERN to recognize "Id." (Bluebook) and "pp." prefixes
                       Switched from router to unified_router import
     2025-12-05 13:15: Verified ibid detection passes 13/13 tests including Id. at X patterns
+    2025-12-09: Refactored to two-phase processing:
+                Phase 1: Parallel API lookups (preserves 10x speed)
+                Phase 2: Sequential ibid/short form logic (fixes history tracking)
 """
 
 import os
@@ -924,21 +927,108 @@ def process_document(
             print(f"[process_document] Error in get_citation: {e}")
             return None, None
     
-    def process_single_note(note: Dict[str, str], note_type: str) -> ProcessedCitation:
+    def fetch_metadata_for_note(note: Dict[str, str], note_type: str) -> Dict[str, Any]:
         """
-        Process a single endnote or footnote.
+        Phase 1: Fetch metadata for a single note (parallelizable).
+        
+        Returns a dict with all info needed for Phase 2 processing.
+        Does NOT access citation history (that's Phase 2).
         """
         note_id = note['id']
         original_text = note['text']
         
+        # Check if this is an explicit ibid - no API call needed
+        if is_ibid(original_text):
+            return {
+                'note_id': note_id,
+                'note_type': note_type,
+                'original_text': original_text,
+                'is_explicit_ibid': True,
+                'ibid_page': extract_ibid_page(original_text),
+                'metadata': None,
+                'formatted': None,
+                'error': None
+            }
+        
+        # Call API to get metadata
         try:
-            # Case 1: Explicit ibid reference
-            if is_ibid(original_text):
+            metadata, full_formatted = get_citation_with_timeout(original_text, style)
+            
+            # Extract URL if available
+            current_url = None
+            if metadata:
+                current_url = getattr(metadata, 'url', None)
+            if not current_url and original_text.strip().startswith('http'):
+                current_url = original_text.strip()
+            
+            return {
+                'note_id': note_id,
+                'note_type': note_type,
+                'original_text': original_text,
+                'is_explicit_ibid': False,
+                'ibid_page': None,
+                'metadata': metadata,
+                'formatted': full_formatted,
+                'current_url': current_url,
+                'error': None if metadata else "No metadata found"
+            }
+        except Exception as e:
+            return {
+                'note_id': note_id,
+                'note_type': note_type,
+                'original_text': original_text,
+                'is_explicit_ibid': False,
+                'ibid_page': None,
+                'metadata': None,
+                'formatted': None,
+                'current_url': None,
+                'error': str(e)
+            }
+    
+    # =========================================================================
+    # TWO-PHASE PROCESSING
+    # Phase 1: Parallel API lookups (fast - 10 workers)
+    # Phase 2: Sequential ibid/short form detection (requires order)
+    # =========================================================================
+    
+    # Combine all notes with their types, maintaining document order
+    all_notes = [(note, 'endnote') for note in endnotes]
+    all_notes += [(note, 'footnote') for note in footnotes]
+    
+    total_notes = len(all_notes)
+    print(f"[process_document] Processing {len(endnotes)} endnotes, {len(footnotes)} footnotes ({total_notes} total)")
+    
+    # --- PHASE 1: Parallel metadata fetching ---
+    print(f"[process_document] Phase 1: Fetching metadata in parallel...")
+    PARALLEL_WORKERS = 10
+    
+    def fetch_wrapper(args):
+        note, note_type = args
+        print(f"[process_document] Fetching: {note.get('text', '')[:40]}...")
+        return fetch_metadata_for_note(note, note_type)
+    
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        fetched_data = list(executor.map(fetch_wrapper, all_notes))
+    
+    print(f"[process_document] Phase 1 complete: {len(fetched_data)} notes fetched")
+    
+    # --- PHASE 2: Sequential citation form determination ---
+    print(f"[process_document] Phase 2: Applying ibid/short form logic sequentially...")
+    results = []
+    
+    for idx, data in enumerate(fetched_data):
+        note_id = data['note_id']
+        note_type = data['note_type']
+        original_text = data['original_text']
+        
+        try:
+            # Case 1: Explicit ibid reference (user typed "ibid")
+            if data['is_explicit_ibid']:
                 previous_metadata = history.get_previous_metadata()
                 
                 if previous_metadata is None:
                     print(f"[process_document] Warning: ibid in {note_type} {note_id} but no previous citation")
-                    return ProcessedCitation(
+                    results.append(ProcessedCitation(
                         original=original_text,
                         formatted=original_text,
                         metadata=None,
@@ -946,44 +1036,44 @@ def process_document(
                         success=False,
                         error="ibid reference but no previous citation found",
                         citation_form="ibid"
-                    )
+                    ))
+                    continue
                 
-                page = extract_ibid_page(original_text)
-                formatted = BaseFormatter.format_ibid(page)
+                formatted = BaseFormatter.format_ibid(data['ibid_page'])
                 
                 if note_type == 'endnote':
                     processor.write_endnote(note_id, formatted)
                 else:
                     processor.write_footnote(note_id, formatted)
                 
-                return ProcessedCitation(
+                results.append(ProcessedCitation(
                     original=original_text,
                     formatted=formatted,
                     metadata=previous_metadata,
                     url=history.get_previous_url(),
                     success=True,
                     citation_form="ibid"
-                )
+                ))
+                continue
             
-            # Case 2+: Process citation to get metadata (with timeout)
-            metadata, full_formatted = get_citation_with_timeout(original_text, style)
+            # Case 2: API lookup failed
+            metadata = data['metadata']
+            full_formatted = data['formatted']
+            current_url = data.get('current_url')
             
             if not metadata or not full_formatted:
-                return ProcessedCitation(
+                results.append(ProcessedCitation(
                     original=original_text,
                     formatted=original_text,
                     metadata=None,
                     url=None,
                     success=False,
-                    error="No metadata found",
+                    error=data.get('error', "No metadata found"),
                     citation_form="full"
-                )
+                ))
+                continue
             
-            current_url = getattr(metadata, 'url', None)
-            if not current_url and original_text.strip().startswith('http'):
-                current_url = original_text.strip()
-            
-            # Case 2: Check if same URL as previous → ibid
+            # Case 3: Check if same URL as previous → ibid
             previous_url = history.get_previous_url()
             if current_url and previous_url and urls_match(current_url, previous_url):
                 formatted = BaseFormatter.format_ibid()
@@ -993,16 +1083,17 @@ def process_document(
                 else:
                     processor.write_footnote(note_id, formatted)
                 
-                return ProcessedCitation(
+                results.append(ProcessedCitation(
                     original=original_text,
                     formatted=formatted,
                     metadata=history.get_previous_metadata(),
                     url=current_url,
                     success=True,
                     citation_form="ibid"
-                )
+                ))
+                continue
             
-            # Case 3: Check if same source as previous → ibid
+            # Case 4: Check if same source as previous → ibid
             if history.is_same_as_previous(metadata):
                 formatted = BaseFormatter.format_ibid()
                 
@@ -1011,16 +1102,19 @@ def process_document(
                 else:
                     processor.write_footnote(note_id, formatted)
                 
-                return ProcessedCitation(
+                results.append(ProcessedCitation(
                     original=original_text,
                     formatted=formatted,
                     metadata=metadata,
                     url=current_url,
                     success=True,
                     citation_form="ibid"
-                )
+                ))
+                # Update history with current source
+                history.add(metadata, formatted)
+                continue
             
-            # Case 4: Check if previously cited → short form
+            # Case 5: Check if previously cited → short form
             if history.has_been_cited_before(metadata):
                 formatted = formatter.format_short(metadata)
                 
@@ -1031,16 +1125,17 @@ def process_document(
                 
                 history.add(metadata, formatted)
                 
-                return ProcessedCitation(
+                results.append(ProcessedCitation(
                     original=original_text,
                     formatted=formatted,
                     metadata=metadata,
                     url=current_url,
                     success=True,
                     citation_form="short"
-                )
+                ))
+                continue
             
-            # Case 5: New source → full citation
+            # Case 6: New source → full citation
             if note_type == 'endnote':
                 processor.write_endnote(note_id, full_formatted)
             else:
@@ -1048,18 +1143,18 @@ def process_document(
             
             history.add(metadata, full_formatted)
             
-            return ProcessedCitation(
+            results.append(ProcessedCitation(
                 original=original_text,
                 formatted=full_formatted,
                 metadata=metadata,
                 url=current_url,
                 success=True,
                 citation_form="full"
-            )
-                
+            ))
+            
         except Exception as e:
             print(f"[process_document] Error processing {note_type} {note_id}: {e}")
-            return ProcessedCitation(
+            results.append(ProcessedCitation(
                 original=original_text,
                 formatted=original_text,
                 metadata=None,
@@ -1067,28 +1162,9 @@ def process_document(
                 success=False,
                 error=str(e),
                 citation_form="full"
-            )
+            ))
     
-    # Process endnotes and footnotes IN PARALLEL for 10x speedup
-    total_notes = len(endnotes) + len(footnotes)
-    print(f"[process_document] Processing {len(endnotes)} endnotes, {len(footnotes)} footnotes ({total_notes} total) IN PARALLEL")
-    
-    # Combine all notes with their types for parallel processing
-    all_notes = [(note, 'endnote', idx) for idx, note in enumerate(endnotes)]
-    all_notes += [(note, 'footnote', idx) for idx, note in enumerate(footnotes)]
-    
-    # Process in parallel with 10 workers
-    PARALLEL_WORKERS = 10
-    
-    def process_note_wrapper(args):
-        note, note_type, idx = args
-        print(f"[process_document] Processing {note_type} {idx+1}: {note.get('text', '')[:40]}...")
-        result = process_single_note(note, note_type)
-        print(f"[process_document] {note_type.capitalize()} {idx+1} {'✓' if result.success else '✗'}")
-        return result
-    
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-        results = list(executor.map(process_note_wrapper, all_notes))
+    print(f"[process_document] Phase 2 complete: {len(results)} notes processed")
     
     # Save to buffer
     doc_buffer = processor.save_to_buffer()
