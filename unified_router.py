@@ -1273,10 +1273,14 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
     1. Extract DOI from URL → Crossref lookup
     2. Academic publisher URL → Crossref search
     3. Medical URL → PubMed
-    4. Newspaper URL → Newspaper extractor
-    5. Government URL → Government extractor
-    6. Generic URL → Basic metadata extraction
+    4. Newspaper URL → Newspaper extractor + Claude fallback
+    5. Government URL → Government extractor + Claude fallback
+    6. Generic URL → Basic metadata extraction + Claude fallback
+    
+    UPDATED 2025-12-09: Added newspaper/government detection and Claude fallback
     """
+    from urllib.parse import urlparse
+    
     # Check for DOI in URL
     doi = extract_doi_from_url(url)
     if doi:
@@ -1321,8 +1325,196 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
         except Exception:
             pass
     
-    # Fallback to standard extraction
-    return extract_by_type(url, CitationType.URL)
+    # =========================================================================
+    # FIX 2025-12-09: Check newspaper and government domains
+    # =========================================================================
+    
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().replace('www.', '')
+    except:
+        domain = ""
+    
+    # Check for newspaper domains
+    newspaper_domains = [
+        'nytimes.com', 'washingtonpost.com', 'wsj.com', 'latimes.com',
+        'theguardian.com', 'bbc.com', 'bbc.co.uk', 'reuters.com', 'apnews.com',
+        'theatlantic.com', 'newyorker.com', 'economist.com', 'ft.com',
+        'politico.com', 'axios.com', 'vox.com', 'slate.com', 'salon.com',
+        'huffpost.com', 'buzzfeednews.com', 'vice.com', 'thedailybeast.com',
+        'usatoday.com', 'chicagotribune.com', 'bostonglobe.com', 'sfchronicle.com',
+        'nypost.com', 'nydailynews.com', 'newsweek.com', 'time.com',
+        'forbes.com', 'businessinsider.com', 'cnbc.com', 'bloomberg.com',
+        'cnn.com', 'foxnews.com', 'msnbc.com', 'nbcnews.com', 'cbsnews.com',
+        'abcnews.go.com', 'npr.org', 'pbs.org', 'harpers.org', 'theroot.com',
+    ]
+    
+    is_newspaper = any(news in domain for news in newspaper_domains)
+    
+    # Check for government domains (UK, US, etc.)
+    government_patterns = [
+        'gov.uk', 'nhs.uk', 'nice.org.uk', 'parliament.uk',
+        'gov.scot', 'gov.wales', '.gov', 'gc.ca', 'canada.ca',
+        'gov.au', 'govt.nz', 'gov.ie', 'europa.eu',
+    ]
+    
+    is_government = any(pattern in domain for pattern in government_patterns)
+    
+    # Route to appropriate extractor
+    if is_newspaper:
+        print(f"[UnifiedRouter] Detected newspaper URL: {domain}")
+        result = extract_by_type(url, CitationType.NEWSPAPER)
+        if result and _has_good_url_metadata(result, url):
+            return result
+        # Try Claude fallback
+        claude_result = _claude_url_fallback(url, CitationType.NEWSPAPER)
+        if claude_result:
+            return claude_result
+        return result  # Return whatever we got
+    
+    if is_government:
+        print(f"[UnifiedRouter] Detected government URL: {domain}")
+        result = extract_by_type(url, CitationType.GOVERNMENT)
+        if result and _has_good_url_metadata(result, url):
+            return result
+        # Try Claude fallback
+        claude_result = _claude_url_fallback(url, CitationType.GOVERNMENT)
+        if claude_result:
+            return claude_result
+        return result  # Return whatever we got
+    
+    # Fallback to standard extraction with Claude fallback
+    result = extract_by_type(url, CitationType.URL)
+    if result and _has_good_url_metadata(result, url):
+        return result
+    
+    # Try Claude fallback for unknown URLs
+    claude_result = _claude_url_fallback(url, CitationType.URL)
+    if claude_result:
+        return claude_result
+    
+    return result
+
+
+def _has_good_url_metadata(result: CitationMetadata, url: str) -> bool:
+    """Check if URL extraction returned meaningful data."""
+    if not result:
+        return False
+    
+    # Check title is not just domain name
+    if not result.title:
+        return False
+    
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().replace('www.', '')
+        domain_base = domain.split('.')[0]
+    except:
+        return True  # Can't parse, assume OK
+    
+    title_lower = result.title.lower().strip()
+    
+    # Title is just the domain
+    if title_lower == domain or title_lower == domain_base:
+        return False
+    
+    # Title is very short
+    if len(result.title) < 5:
+        return False
+    
+    return True
+
+
+def _claude_url_fallback(url: str, citation_type: CitationType) -> Optional[CitationMetadata]:
+    """
+    Use Claude to identify URL content when scraping fails.
+    
+    FIX 2025-12-09: Added as fallback for blocked/JS-rendered pages.
+    """
+    try:
+        from claude_router import _get_client, CLAUDE_MODEL
+    except ImportError:
+        print(f"[UnifiedRouter] Claude router not available for URL fallback")
+        return None
+    
+    client = _get_client()
+    if not client:
+        return None
+    
+    try:
+        print(f"[UnifiedRouter] Asking Claude about URL: {url[:60]}...")
+        
+        prompt = f"""Identify this URL and provide citation metadata. The URL is:
+{url}
+
+If you recognize this URL or know what article/document it points to, provide the metadata.
+If this is a newspaper/magazine article, include the author's name if known.
+If this is a government document, include the issuing agency and country.
+
+Respond ONLY with JSON (no other text):
+{{
+    "title": "Full article/document title",
+    "authors": ["Author Name"],
+    "date": "Month DD, YYYY",
+    "publication": "Publication name",
+    "country": "Country (for government docs)",
+    "type": "newspaper|government|article",
+    "confidence": 0.0-1.0
+}}
+
+If you don't recognize this URL, respond with {{"confidence": 0}}"""
+
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        text = response.content[0].text.strip()
+        
+        # Parse JSON response
+        import json
+        json_match = re.search(r'\{[\s\S]*\}', text)
+        if json_match:
+            data = json.loads(json_match.group())
+            
+            if data.get('confidence', 0) < 0.5:
+                print(f"[UnifiedRouter] Claude low confidence for URL: {data.get('confidence')}")
+                return None
+            
+            print(f"[UnifiedRouter] Claude identified URL: {data.get('title', '')[:50]}...")
+            
+            # Build CitationMetadata
+            from datetime import datetime
+            access_date = datetime.now().strftime('%B %d, %Y').replace(' 0', ' ')
+            
+            # Determine type
+            url_type = data.get('type', 'article')
+            if url_type == 'newspaper':
+                final_type = CitationType.NEWSPAPER
+            elif url_type == 'government':
+                final_type = CitationType.GOVERNMENT
+            else:
+                final_type = citation_type
+            
+            return CitationMetadata(
+                citation_type=final_type,
+                raw_source=url,
+                source_engine="Claude URL Lookup",
+                url=url,
+                title=data.get('title', ''),
+                authors=data.get('authors', []),
+                date=data.get('date', ''),
+                newspaper=data.get('publication', '') if url_type == 'newspaper' else None,
+                agency=data.get('publication', '') if url_type == 'government' else None,
+                access_date=access_date,
+            )
+            
+    except Exception as e:
+        print(f"[UnifiedRouter] Claude URL fallback error: {e}")
+    
+    return None
 
 
 # =============================================================================
