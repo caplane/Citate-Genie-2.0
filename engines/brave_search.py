@@ -36,7 +36,12 @@ from models import CitationMetadata, CitationType
 # CONFIGURATION
 # =============================================================================
 
-BRAVE_API_KEY = os.environ.get('BRAVE_API_KEY', '')
+# Try to import from config, fall back to environment variable
+try:
+    from config import BRAVE_API_KEY
+except ImportError:
+    BRAVE_API_KEY = os.environ.get('BRAVE_API_KEY', '')
+
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 
 # Request timeout (seconds)
