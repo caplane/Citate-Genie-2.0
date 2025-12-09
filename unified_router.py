@@ -1119,6 +1119,66 @@ def _route_book(query: str) -> Optional[CitationMetadata]:
 # UNIFIED JOURNAL SEARCH (parallel execution)
 # =============================================================================
 
+def _validate_journal_match(query: str, result: CitationMetadata) -> bool:
+    """
+    Validate that a journal/academic result matches the search query.
+    
+    Similar to book validation - prevents returning wrong articles like
+    "Jieli Chen et al." for "Caplan trains brains".
+    
+    Requirements:
+    1. At least 2 meaningful words from query must appear in title+authors
+    2. If query has a 4-digit year, it should match (with 1 year tolerance)
+    
+    FIX for Bug: Added 2025-12-09
+    """
+    if not result or not result.title:
+        return False
+    
+    query_lower = query.lower()
+    
+    # Build searchable text from result
+    searchable = result.title.lower()
+    if result.authors:
+        searchable += ' ' + ' '.join(result.authors).lower()
+    
+    # Common words to ignore
+    stop_words = {'the', 'a', 'an', 'of', 'and', 'in', 'on', 'at', 'to', 'for', 'by', 'with'}
+    
+    # Extract meaningful words from query (3+ chars, not stop words, not year)
+    query_words = [w for w in query_lower.split() 
+                   if len(w) >= 3 and w not in stop_words and not w.isdigit()]
+    
+    if not query_words:
+        return True  # Nothing to match against
+    
+    # Count how many query words appear in searchable text
+    matches = sum(1 for word in query_words if word in searchable)
+    
+    # Require at least 2 matches, OR all matches if only 1-2 words
+    min_required = min(2, len(query_words))
+    word_match = matches >= min_required
+    
+    # Check year if query contains one
+    year_match = True  # Default to true if no year in query
+    year_in_query = re.search(r'\b(19|20)\d{2}\b', query)
+    if year_in_query and result.year:
+        query_year = int(year_in_query.group())
+        try:
+            result_year = int(str(result.year)[:4])
+            # Allow 1 year tolerance for publication date variations
+            year_match = abs(query_year - result_year) <= 1
+        except (ValueError, TypeError):
+            year_match = True  # Can't compare, allow it
+    
+    if word_match and year_match:
+        print(f"[JournalMatch] ✓ Matched {matches}/{len(query_words)} words: {query_words}")
+    else:
+        print(f"[JournalMatch] ✗ Only {matches}/{len(query_words)} words matched in '{result.title[:50]}...'")
+    
+    return word_match and year_match
+
+
 def _route_journal(query: str) -> Optional[CitationMetadata]:
     """
     Route journal/academic queries using parallel API execution.
@@ -1178,8 +1238,10 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
             try:
                 result = future.result(timeout=2)
                 if result and result.has_minimum_data():
-                    result.source_engine = engine_name
-                    results.append(result)
+                    # FIX 2025-12-09: Validate result matches query before accepting
+                    if _validate_journal_match(query, result):
+                        result.source_engine = engine_name
+                        results.append(result)
             except Exception:
                 pass
     
@@ -1454,8 +1516,10 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
             metadatas = _crossref.search_multiple(query, limit)
             for meta in metadatas:
                 if meta and meta.has_minimum_data():
-                    formatted = formatter.format(meta)
-                    results.append((meta, formatted, "Crossref"))
+                    # FIX 2025-12-09: Validate result matches query
+                    if _validate_journal_match(query, meta):
+                        formatted = formatter.format(meta)
+                        results.append((meta, formatted, "Crossref"))
         except Exception:
             pass
         
@@ -1464,14 +1528,16 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
             try:
                 ss_result = _semantic.search(query)
                 if ss_result and ss_result.has_minimum_data():
-                    is_duplicate = any(
-                        ss_result.title and r[0].title and 
-                        ss_result.title.lower()[:30] == r[0].title.lower()[:30]
-                        for r in results
-                    )
-                    if not is_duplicate:
-                        formatted = formatter.format(ss_result)
-                        results.append((ss_result, formatted, "Semantic Scholar"))
+                    # FIX 2025-12-09: Validate result matches query
+                    if _validate_journal_match(query, ss_result):
+                        is_duplicate = any(
+                            ss_result.title and r[0].title and 
+                            ss_result.title.lower()[:30] == r[0].title.lower()[:30]
+                            for r in results
+                        )
+                        if not is_duplicate:
+                            formatted = formatter.format(ss_result)
+                            results.append((ss_result, formatted, "Semantic Scholar"))
             except Exception:
                 pass
         
@@ -1483,6 +1549,9 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
                 for data in book_results:
                     if len(results) >= limit:
                         break
+                    # FIX 2025-12-09: Validate book matches query before adding
+                    if not _validate_book_match(query, data):
+                        continue
                     meta = _book_dict_to_metadata(data, query)
                     if meta and meta.has_minimum_data():
                         # Check for duplicates
@@ -1507,6 +1576,9 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
             for data in book_results:
                 if len(results) >= limit:
                     break
+                # FIX 2025-12-09: Validate book matches query before adding
+                if not _validate_book_match(query, data):
+                    continue
                 meta = _book_dict_to_metadata(data, query)
                 if meta and meta.has_minimum_data():
                     # Check for duplicates

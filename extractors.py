@@ -214,6 +214,7 @@ def extract_newspaper(url: str) -> CitationMetadata:
     
     # =========================================================================
     # TITLE EXTRACTION FROM URL SLUG
+    # FIX 2025-12-09: Don't use numeric slugs or short codes as titles
     # =========================================================================
     
     path = parsed.path.rstrip('/')
@@ -224,22 +225,29 @@ def extract_newspaper(url: str) -> CitationMetadata:
         # Remove file extensions
         slug = re.sub(r'\.(html?|php|aspx?)$', '', slug)
         
-        # Convert slug to title
-        clean_title = slug.replace('-', ' ').replace('_', ' ').title()
+        # FIX: Skip if slug is purely numeric (like "685138") or too short to be meaningful
+        # Also skip if it looks like a document code (alphanumeric, short, no real words)
+        is_numeric = slug.isdigit()
+        is_too_short = len(slug) < 4
+        is_code_like = bool(re.match(r'^[a-z]{1,3}\d+$', slug.lower()))  # e.g., "ng255", "id123"
         
-        # Fix common acronyms that get incorrectly title-cased
-        acronym_fixes = {
-            'Fda': 'FDA', 'Nih': 'NIH', 'Cdc': 'CDC',
-            'Us': 'US', 'Uk': 'UK', 'Ai': 'AI',
-            'Ceo': 'CEO', 'Cfo': 'CFO', 'Cto': 'CTO',
-            'Nasa': 'NASA', 'Fbi': 'FBI', 'Cia': 'CIA',
-            'Nba': 'NBA', 'Nfl': 'NFL', 'Mlb': 'MLB',
-            'Covid': 'COVID', 'Dna': 'DNA', 'Rna': 'RNA',
-        }
-        for wrong, right in acronym_fixes.items():
-            clean_title = re.sub(r'\b' + wrong + r'\b', right, clean_title)
-        
-        metadata.title = clean_title
+        if not is_numeric and not is_too_short and not is_code_like:
+            # Convert slug to title
+            clean_title = slug.replace('-', ' ').replace('_', ' ').title()
+            
+            # Fix common acronyms that get incorrectly title-cased
+            acronym_fixes = {
+                'Fda': 'FDA', 'Nih': 'NIH', 'Cdc': 'CDC',
+                'Us': 'US', 'Uk': 'UK', 'Ai': 'AI',
+                'Ceo': 'CEO', 'Cfo': 'CFO', 'Cto': 'CTO',
+                'Nasa': 'NASA', 'Fbi': 'FBI', 'Cia': 'CIA',
+                'Nba': 'NBA', 'Nfl': 'NFL', 'Mlb': 'MLB',
+                'Covid': 'COVID', 'Dna': 'DNA', 'Rna': 'RNA',
+            }
+            for wrong, right in acronym_fixes.items():
+                clean_title = re.sub(r'\b' + wrong + r'\b', right, clean_title)
+            
+            metadata.title = clean_title
     
     # =========================================================================
     # DATE EXTRACTION FROM URL PATH
@@ -324,8 +332,13 @@ def extract_government(url_or_text: str) -> CitationMetadata:
             slug = path.split('/')[-1]
             # Remove file extensions
             slug = re.sub(r'\.[a-z]{2,4}$', '', slug)
-            # Convert to title
-            metadata.title = slug.replace('-', ' ').replace('_', ' ').title()
+            # FIX 2025-12-09: Skip numeric/code-like slugs
+            is_numeric = slug.isdigit()
+            is_too_short = len(slug) < 4
+            is_code_like = bool(re.match(r'^[a-z]{1,3}\d+$', slug.lower()))
+            if not is_numeric and not is_too_short and not is_code_like:
+                # Convert to title
+                metadata.title = slug.replace('-', ' ').replace('_', ' ').title()
     else:
         # Not a URL - might be a Federal Register reference
         metadata.agency = "U.S. Government"
@@ -367,7 +380,11 @@ def extract_url(url: str) -> CitationMetadata:
     if path:
         slug = path.split('/')[-1]
         slug = re.sub(r'\.[a-z]{2,4}$', '', slug)
-        if slug:
+        # FIX 2025-12-09: Skip numeric/code-like slugs
+        is_numeric = slug.isdigit() if slug else True
+        is_too_short = len(slug) < 4 if slug else True
+        is_code_like = bool(re.match(r'^[a-z]{1,3}\d+$', slug.lower())) if slug else False
+        if slug and not is_numeric and not is_too_short and not is_code_like:
             metadata.title = slug.replace('-', ' ').replace('_', ' ').title()
         else:
             metadata.title = domain
