@@ -1023,6 +1023,70 @@ def _route_legal(query: str) -> Optional[CitationMetadata]:
 # UNIFIED BOOK SEARCH (uses books.py)
 # =============================================================================
 
+def _validate_book_match(query: str, book_dict: dict) -> bool:
+    """
+    Validate that a book result actually matches the search query.
+    
+    Prevents returning wrong books like "Tackle Football..." for "Caplan trains brains".
+    
+    Requirements:
+    1. At least 2 meaningful words from query must appear in title+authors
+    2. If query has a 4-digit year, it should match (with 1 year tolerance)
+    
+    FIX for Bug #2: Added 2025-12-09
+    """
+    if not book_dict:
+        return False
+    
+    query_lower = query.lower()
+    
+    # Build searchable text from book result
+    title = book_dict.get('title', '')
+    authors = book_dict.get('authors', [])
+    searchable = title.lower()
+    if authors:
+        searchable += ' ' + ' '.join(authors).lower()
+    
+    # Common words to ignore
+    stop_words = {'the', 'a', 'an', 'of', 'and', 'in', 'on', 'at', 'to', 'for', 'by', 'with'}
+    
+    # Extract meaningful words from query (3+ chars, not stop words, not year)
+    query_words = [w for w in query_lower.split() 
+                   if len(w) >= 3 and w not in stop_words and not w.isdigit()]
+    
+    if not query_words:
+        return True  # Nothing to match against
+    
+    # Count how many query words appear in searchable text
+    matches = sum(1 for word in query_words if word in searchable)
+    
+    # Require at least 2 matches, OR all matches if only 1-2 words
+    min_required = min(2, len(query_words))
+    word_match = matches >= min_required
+    
+    # Check year if query contains one
+    year_match = True  # Default to true if no year in query
+    year_in_query = re.search(r'\b(19|20)\d{2}\b', query)
+    book_year = book_dict.get('year', '')
+    if year_in_query and book_year:
+        query_year = int(year_in_query.group())
+        try:
+            result_year = int(str(book_year)[:4])
+            # Allow 1 year tolerance for publication date variations
+            year_match = abs(query_year - result_year) <= 1
+        except (ValueError, TypeError):
+            year_match = True  # Can't compare, allow it
+    
+    if word_match and year_match:
+        print(f"[BookMatch] ✓ Matched {matches}/{len(query_words)} words: {query_words}")
+    else:
+        print(f"[BookMatch] ✗ Only {matches}/{len(query_words)} words matched in '{title[:50]}...'")
+        print(f"[BookMatch]   Query words: {query_words}")
+        print(f"[BookMatch]   Searchable: {searchable[:80]}...")
+    
+    return word_match and year_match
+
+
 def _route_book(query: str) -> Optional[CitationMetadata]:
     """
     Route book queries using Cite Fix Pro's books.py.
@@ -1031,11 +1095,20 @@ def _route_book(query: str) -> Optional[CitationMetadata]:
     1. Dual-engine: Open Library (precise ISBN) + Google Books (fuzzy search)
     2. PUBLISHER_PLACE_MAP fills in publication places
     3. ISBN detection routes to Open Library first
+    
+    UPDATED 2025-12-09: Added validation to prevent wrong book matches.
     """
     try:
         results = books.extract_metadata(query)
         if results and len(results) > 0:
-            return _book_dict_to_metadata(results[0], query)
+            # Validate each result until we find one that matches
+            for result in results:
+                if _validate_book_match(query, result):
+                    return _book_dict_to_metadata(result, query)
+            
+            # If no result matches, log warning and return None
+            print(f"[UnifiedRouter] No book results matched query: {query[:50]}...")
+            return None
     except Exception as e:
         print(f"[UnifiedRouter] Book search error: {e}")
     
@@ -1251,6 +1324,12 @@ def route_citation(query: str, style: str = "chicago") -> Tuple[Optional[Citatio
     
     elif detection.citation_type == CitationType.BOOK:
         metadata = _route_book(query)
+        # FIX 2025-12-09: If book search fails (validation rejected or not found),
+        # try journal engines as fallback. Fragmentary queries like "Caplan trains brains"
+        # might be journal articles misdetected as books.
+        if not metadata:
+            print(f"[UnifiedRouter] Book search failed, trying journal engines...")
+            metadata = _route_journal(query)
     
     elif detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
         # Check famous papers cache first
