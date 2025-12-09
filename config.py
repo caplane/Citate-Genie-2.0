@@ -22,6 +22,7 @@ SEMANTIC_SCHOLAR_API_KEY = os.environ.get('SEMANTIC_SCHOLAR_API_KEY', '')
 GOOGLE_CSE_API_KEY = os.environ.get('GOOGLE_CSE_API_KEY', '')
 GOOGLE_CSE_ID = os.environ.get('GOOGLE_CSE_ID', '')
 SERPAPI_KEY = os.environ.get('SERPAPI_KEY', '')
+BRAVE_API_KEY = os.environ.get('BRAVE_API_KEY', '')  # For fast URL citation lookup
 
 # =============================================================================
 # HTTP SETTINGS

@@ -1401,9 +1401,17 @@ def _has_good_url_metadata(result: CitationMetadata, url: str) -> bool:
     if not result:
         return False
     
-    # Check title is not just domain name or publication name
+    # No title at all
     if not result.title:
         return False
+    
+    # FIX 2025-12-09: For newspaper URLs, ALWAYS require an author
+    # This ensures Claude fallback is triggered for paywalled/blocked sites
+    if result.citation_type == CitationType.NEWSPAPER:
+        has_author = result.authors and len(result.authors) > 0
+        if not has_author:
+            print(f"[UnifiedRouter] Newspaper URL has no author, triggering Claude fallback")
+            return False
     
     try:
         from urllib.parse import urlparse
@@ -1414,123 +1422,230 @@ def _has_good_url_metadata(result: CitationMetadata, url: str) -> bool:
         return True  # Can't parse, assume OK
     
     title_lower = result.title.lower().strip()
-    title_no_spaces = title_lower.replace(' ', '').replace('-', '')
+    title_normalized = title_lower.replace(' ', '').replace('-', '').replace('the', '')
+    domain_normalized = domain_base.replace('the', '')
     
-    # Title is just the domain (with or without spaces)
-    # e.g., "The Atlantic" matches "theatlantic"
-    if title_lower == domain or title_lower == domain_base:
-        return False
-    if title_no_spaces == domain_base or title_no_spaces == domain.replace('.', ''):
+    # Title is just the domain/publication name (with or without spaces/articles)
+    if title_normalized == domain_normalized:
+        print(f"[UnifiedRouter] Title matches domain name, triggering Claude fallback")
         return False
     
     # Title is very short (likely just a site name)
-    if len(result.title) < 10:
+    if len(result.title) < 15:
+        print(f"[UnifiedRouter] Title too short ({len(result.title)} chars), triggering Claude fallback")
         return False
-    
-    # FIX 2025-12-09: For newspaper URLs, we need both title AND author
-    # Just having the publication name is not enough
-    if result.citation_type == CitationType.NEWSPAPER:
-        has_author = result.authors and len(result.authors) > 0
-        # If no author and title looks like publication name, it's minimal
-        if not has_author:
-            # Common publication name patterns
-            pub_names = ['atlantic', 'new yorker', 'guardian', 'times', 'post', 
-                         'journal', 'tribune', 'chronicle', 'herald', 'news']
-            if any(pub in title_lower for pub in pub_names) and len(result.title) < 30:
-                return False
     
     return True
 
 
 def _claude_url_fallback(url: str, citation_type: CitationType) -> Optional[CitationMetadata]:
     """
-    Use Claude to identify URL content when scraping fails.
+    Fast URL citation lookup using Brave Search API (preferred) or Claude.
     
-    FIX 2025-12-09: Added as fallback for blocked/JS-rendered pages.
+    Priority:
+    1. Brave Search API (~1-2 sec) - if BRAVE_API_KEY is set
+    2. Claude + web search (~5-15 sec) - fallback
+    3. URL path extraction (<1 sec) - last resort
+    
+    FIX 2025-12-09: Added Brave Search for ~5x faster lookups.
     """
+    
+    # =========================================================================
+    # OPTION 1: Brave Search (fastest - ~1-2 sec)
+    # =========================================================================
+    try:
+        from engines.brave_search import search_url_fallback, BRAVE_API_KEY
+        if BRAVE_API_KEY:
+            print(f"[UnifiedRouter] Using Brave Search for URL: {url[:50]}...")
+            result = search_url_fallback(url, citation_type)
+            if result and result.title and len(result.title) > 10:
+                return result
+            print(f"[UnifiedRouter] Brave Search returned no/minimal result")
+    except ImportError:
+        pass  # Brave Search not available
+    except Exception as e:
+        print(f"[UnifiedRouter] Brave Search error: {e}")
+    
+    # =========================================================================
+    # OPTION 2: Claude + Web Search (slower - ~5-15 sec)
+    # =========================================================================
     try:
         from claude_router import _get_client, CLAUDE_MODEL
-    except ImportError:
-        print(f"[UnifiedRouter] Claude router not available for URL fallback")
-        return None
-    
-    client = _get_client()
-    if not client:
-        return None
-    
-    try:
-        print(f"[UnifiedRouter] Asking Claude about URL: {url[:60]}...")
         
-        prompt = f"""Identify this URL and provide citation metadata. The URL is:
-{url}
+        client = _get_client()
+        if client:
+            print(f"[UnifiedRouter] Using Claude web search for URL: {url[:50]}...")
+            
+            # Extract search terms from URL
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            domain = parsed.netloc.lower().replace('www.', '')
+            path = parsed.path.strip('/')
+            
+            slug_parts = []
+            for seg in path.split('/'):
+                if '-' in seg and not seg.isdigit() and len(seg) > 5:
+                    slug_parts.append(seg.replace('-', ' '))
+            
+            search_query = f"{domain.split('.')[0]} {' '.join(slug_parts)}"
+            
+            prompt = f"""I need citation information for this URL: {url}
 
-If you recognize this URL or know what article/document it points to, provide the metadata.
-If this is a newspaper/magazine article, include the author's name if known.
-If this is a government document, include the issuing agency and country.
+Search for this article and provide the citation metadata. Search query hint: {search_query}
 
-Respond ONLY with JSON (no other text):
+After searching, respond with ONLY this JSON (no other text):
 {{
-    "title": "Full article/document title",
+    "title": "Full article title",
     "authors": ["Author Name"],
     "date": "Month DD, YYYY",
     "publication": "Publication name",
-    "country": "Country (for government docs)",
-    "type": "newspaper|government|article",
-    "confidence": 0.0-1.0
-}}
+    "confidence": 1.0
+}}"""
 
-If you don't recognize this URL, respond with {{"confidence": 0}}"""
-
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=400,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        text = response.content[0].text.strip()
-        
-        # Parse JSON response
-        import json
-        json_match = re.search(r'\{[\s\S]*\}', text)
-        if json_match:
-            data = json.loads(json_match.group())
-            
-            if data.get('confidence', 0) < 0.5:
-                print(f"[UnifiedRouter] Claude low confidence for URL: {data.get('confidence')}")
-                return None
-            
-            print(f"[UnifiedRouter] Claude identified URL: {data.get('title', '')[:50]}...")
-            
-            # Build CitationMetadata
-            from datetime import datetime
-            access_date = datetime.now().strftime('%B %d, %Y').replace(' 0', ' ')
-            
-            # Determine type
-            url_type = data.get('type', 'article')
-            if url_type == 'newspaper':
-                final_type = CitationType.NEWSPAPER
-            elif url_type == 'government':
-                final_type = CitationType.GOVERNMENT
-            else:
-                final_type = citation_type
-            
-            return CitationMetadata(
-                citation_type=final_type,
-                raw_source=url,
-                source_engine="Claude URL Lookup",
-                url=url,
-                title=data.get('title', ''),
-                authors=data.get('authors', []),
-                date=data.get('date', ''),
-                newspaper=data.get('publication', '') if url_type == 'newspaper' else None,
-                agency=data.get('publication', '') if url_type == 'government' else None,
-                access_date=access_date,
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=500,
+                tools=[{
+                    "type": "web_search_20250305",
+                    "name": "web_search"
+                }],
+                messages=[{"role": "user", "content": prompt}]
             )
             
+            text = ""
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    text += block.text
+            
+            import json
+            json_match = re.search(r'\{[\s\S]*\}', text)
+            if json_match:
+                data = json.loads(json_match.group())
+                
+                title = data.get('title', '')
+                if title and len(title) > 10 and data.get('confidence', 0) >= 0.5:
+                    print(f"[UnifiedRouter] Claude found: {title[:50]}...")
+                    
+                    from datetime import datetime
+                    access_date = datetime.now().strftime('%B %d, %Y').replace(' 0', ' ')
+                    
+                    return CitationMetadata(
+                        citation_type=citation_type,
+                        raw_source=url,
+                        source_engine="Claude Web Search",
+                        url=url,
+                        title=title,
+                        authors=data.get('authors', []),
+                        date=data.get('date', ''),
+                        newspaper=data.get('publication', '') if citation_type == CitationType.NEWSPAPER else None,
+                        agency=data.get('publication', '') if citation_type == CitationType.GOVERNMENT else None,
+                        access_date=access_date,
+                    )
+                    
+    except ImportError:
+        pass
     except Exception as e:
-        print(f"[UnifiedRouter] Claude URL fallback error: {e}")
+        print(f"[UnifiedRouter] Claude web search error: {e}")
     
-    return None
+    # =========================================================================
+    # OPTION 3: URL Path Extraction (last resort)
+    # =========================================================================
+    return _extract_from_url_path(url, citation_type)
+
+
+def _extract_from_url_path(url: str, citation_type: CitationType) -> Optional[CitationMetadata]:
+    """
+    Extract title from URL path when all else fails.
+    
+    Converts slugs like "private-equity-housing-changes" to readable titles.
+    """
+    from urllib.parse import urlparse
+    from datetime import datetime
+    
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower().replace('www.', '')
+        path = parsed.path.strip('/')
+        
+        if not path:
+            return None
+        
+        # Split path into segments
+        segments = path.split('/')
+        
+        # Find the best segment for title (longest slug with words)
+        best_slug = None
+        for seg in reversed(segments):
+            # Skip numeric-only segments (like "685138")
+            if seg.isdigit():
+                continue
+            # Skip very short segments
+            if len(seg) < 5:
+                continue
+            # Skip date-like segments
+            if re.match(r'^\d{4}$', seg) or re.match(r'^\d{2}$', seg):
+                continue
+            # This looks like a good slug
+            if '-' in seg or '_' in seg:
+                best_slug = seg
+                break
+        
+        if not best_slug:
+            return None
+        
+        # Convert slug to title
+        title = best_slug.replace('-', ' ').replace('_', ' ')
+        # Title case, but preserve common acronyms
+        title = title.title()
+        
+        # Fix common acronyms
+        acronym_fixes = {
+            'Ai': 'AI', 'Us': 'US', 'Uk': 'UK', 'Fda': 'FDA', 'Nih': 'NIH',
+            'Cdc': 'CDC', 'Ceo': 'CEO', 'Covid': 'COVID', 'Nhs': 'NHS',
+        }
+        for wrong, right in acronym_fixes.items():
+            title = re.sub(r'\b' + wrong + r'\b', right, title)
+        
+        print(f"[UnifiedRouter] Extracted title from URL path: {title}")
+        
+        # Try to extract date from URL path (e.g., /2025/12/)
+        date_match = re.search(r'/(\d{4})/(\d{1,2})/', url)
+        date_str = ""
+        if date_match:
+            year, month = date_match.groups()
+            try:
+                from calendar import month_name
+                date_str = f"{month_name[int(month)]} {year}"
+            except:
+                date_str = f"{year}"
+        
+        # Get publication name from domain
+        domain_base = domain.split('.')[0]
+        publication = domain_base.replace('the', '').title()
+        if domain_base == 'theatlantic':
+            publication = 'The Atlantic'
+        elif domain_base == 'nytimes':
+            publication = 'New York Times'
+        elif domain_base == 'washingtonpost':
+            publication = 'Washington Post'
+        
+        access_date = datetime.now().strftime('%B %d, %Y').replace(' 0', ' ')
+        
+        return CitationMetadata(
+            citation_type=citation_type,
+            raw_source=url,
+            source_engine="URL Path Extraction",
+            url=url,
+            title=title,
+            authors=[],  # Can't get author from URL
+            date=date_str,
+            newspaper=publication if citation_type == CitationType.NEWSPAPER else None,
+            access_date=access_date,
+        )
+        
+    except Exception as e:
+        print(f"[UnifiedRouter] URL path extraction error: {e}")
+        return None
 
 
 # =============================================================================
