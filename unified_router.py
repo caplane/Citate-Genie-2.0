@@ -61,6 +61,9 @@ from formatters.base import get_formatter
 # Import CiteFlex Pro engines
 from engines.academic import CrossrefEngine, OpenAlexEngine, SemanticScholarEngine, PubMedEngine
 from engines.doi import extract_doi_from_url, is_academic_publisher_url
+from engines.google_scholar import GoogleScholarEngine
+from engines.arxiv_engine import ArxivEngine
+from engines.youtube_engine import YouTubeEngine, VimeoEngine
 
 # Import Cite Fix Pro modules (now in engines/)
 from engines import superlegal
@@ -123,7 +126,7 @@ else:
 # =============================================================================
 
 PARALLEL_TIMEOUT = 12  # seconds
-MAX_WORKERS = 4
+MAX_WORKERS = 6
 
 # Medical domains that should NOT route to government engine
 MEDICAL_DOMAINS = ['pubmed', 'ncbi.nlm.nih.gov', 'nih.gov/health', 'medlineplus']
@@ -137,6 +140,10 @@ _crossref = CrossrefEngine()
 _openalex = OpenAlexEngine()
 _semantic = SemanticScholarEngine()
 _pubmed = PubMedEngine()
+_google_scholar = GoogleScholarEngine()
+_arxiv = ArxivEngine()
+_youtube = YouTubeEngine()
+_vimeo = VimeoEngine()
 
 
 # =============================================================================
@@ -1119,6 +1126,52 @@ def _route_book(query: str) -> Optional[CitationMetadata]:
 # UNIFIED JOURNAL SEARCH (parallel execution)
 # =============================================================================
 
+def _titles_loosely_match(title1: str, title2: str) -> bool:
+    """
+    Check if two titles are similar enough to be the same work.
+    Used to verify Crossref DOI matches Google Scholar result.
+    
+    Returns True if:
+    - Titles are identical (case-insensitive)
+    - One title contains the other (handles subtitles)
+    - Word overlap is >= 60%
+    """
+    if not title1 or not title2:
+        return False
+    
+    t1 = title1.lower().strip()
+    t2 = title2.lower().strip()
+    
+    # Exact match
+    if t1 == t2:
+        return True
+    
+    # One contains the other (handles subtitles)
+    if t1 in t2 or t2 in t1:
+        return True
+    
+    # Word overlap ratio
+    # Remove common punctuation
+    import re
+    t1_clean = re.sub(r'[^\w\s]', '', t1)
+    t2_clean = re.sub(r'[^\w\s]', '', t2)
+    
+    words1 = set(t1_clean.split())
+    words2 = set(t2_clean.split())
+    
+    # Remove very short words
+    words1 = {w for w in words1 if len(w) > 2}
+    words2 = {w for w in words2 if len(w) > 2}
+    
+    if not words1 or not words2:
+        return False
+    
+    overlap = len(words1 & words2)
+    smaller = min(len(words1), len(words2))
+    
+    return (overlap / smaller) >= 0.6
+
+
 def _validate_journal_match(query: str, result: CitationMetadata) -> bool:
     """
     Validate that a journal/academic result matches the search query.
@@ -1231,6 +1284,8 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
             executor.submit(_openalex.search, query): "OpenAlex",
             executor.submit(_semantic.search, query): "Semantic Scholar",
             executor.submit(_pubmed.search, query): "PubMed",
+            executor.submit(_google_scholar.search, query): "Google Scholar",
+            executor.submit(_arxiv.search, query): "arXiv",
         }
         
         for future in as_completed(futures, timeout=PARALLEL_TIMEOUT):
@@ -1244,6 +1299,28 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
                         results.append(result)
             except Exception:
                 pass
+    
+    # Enrich Google Scholar results with DOI from Crossref
+    for result in results:
+        if result.source_engine == "Google Scholar" and not result.doi:
+            try:
+                # Build search query from title + first author
+                search_terms = result.title[:100] if result.title else ""
+                if result.authors and len(result.authors) > 0:
+                    # Get last name of first author
+                    first_author = result.authors[0].split()[-1]
+                    search_terms = f"{first_author} {search_terms}"
+                
+                if search_terms:
+                    crossref_match = _crossref.search(search_terms)
+                    if crossref_match and crossref_match.doi:
+                        # Verify titles match before accepting DOI
+                        if _titles_loosely_match(result.title, crossref_match.title):
+                            result.doi = crossref_match.doi
+                            result.source_engine = "Google Scholar + Crossref"
+                            print(f"[UnifiedRouter] Enriched Google Scholar with DOI: {result.doi}")
+            except Exception as e:
+                print(f"[UnifiedRouter] DOI enrichment failed: {e}")
     
     # Return best result (prefer one with DOI)
     if results:
@@ -1324,6 +1401,40 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
                 return result
         except Exception:
             pass
+    
+    # =========================================================================
+    # ArXiv URLs
+    # =========================================================================
+    if 'arxiv.org' in url.lower():
+        print(f"[UnifiedRouter] Detected arXiv URL")
+        try:
+            result = _arxiv.search(url)
+            if result and result.has_minimum_data():
+                return result
+        except Exception as e:
+            print(f"[UnifiedRouter] arXiv lookup failed: {e}")
+    
+    # =========================================================================
+    # YouTube/Vimeo video URLs
+    # =========================================================================
+    url_lower = url.lower()
+    if 'youtube.com' in url_lower or 'youtu.be' in url_lower:
+        print(f"[UnifiedRouter] Detected YouTube URL")
+        try:
+            result = _youtube.search(url)
+            if result and result.has_minimum_data():
+                return result
+        except Exception as e:
+            print(f"[UnifiedRouter] YouTube lookup failed: {e}")
+    
+    if 'vimeo.com' in url_lower:
+        print(f"[UnifiedRouter] Detected Vimeo URL")
+        try:
+            result = _vimeo.search(url)
+            if result and result.has_minimum_data():
+                return result
+        except Exception as e:
+            print(f"[UnifiedRouter] Vimeo lookup failed: {e}")
     
     # =========================================================================
     # FIX 2025-12-09: Check newspaper and government domains
