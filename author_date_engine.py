@@ -100,7 +100,8 @@ class AuthorDateEngine:
         author: str,
         year: str,
         second_author: Optional[str] = None,
-        timeout: float = 10.0
+        timeout: float = 5.0,  # Reduced from 10s for faster processing
+        context: Optional[str] = None  # Document field/context for smarter matching
     ) -> Optional[CitationMetadata]:
         """
         Search for a citation by author and year.
@@ -110,6 +111,7 @@ class AuthorDateEngine:
             year: Publication year (e.g., "1977")
             second_author: Optional second author for two-author citations
             timeout: Maximum time to wait for all searches
+            context: Optional context (e.g., "psychology") for smarter matching
             
         Returns:
             Best matching CitationMetadata, or None if not found
@@ -165,6 +167,25 @@ class AuthorDateEngine:
                 except Exception as e:
                     source = futures.get(future, "unknown")
                     print(f"[AuthorDateEngine] {source} error: {e}")
+        
+        # Sort by confidence
+        if results:
+            results.sort(reverse=True)
+            best = results[0]
+            
+            # If best result is high confidence, return it
+            if best.confidence >= 0.6:
+                best.metadata.raw_source = f"({author}, {year})"
+                return best.metadata
+            
+            print(f"[AuthorDateEngine] Low confidence ({best.confidence:.2f}), trying Claude...")
+        else:
+            print(f"[AuthorDateEngine] No API results for {author} ({year}), trying Claude...")
+        
+        # Fallback: Use Claude for difficult/unfound citations
+        claude_results = self._search_claude(author, year, second_author, context)
+        if claude_results:
+            results.extend(claude_results)
         
         if not results:
             return None
@@ -309,6 +330,91 @@ class AuthorDateEngine:
                 ))
         except Exception as e:
             print(f"[AuthorDateEngine] Google Scholar error: {e}")
+        
+        return results
+    
+    def _search_claude(
+        self,
+        author: str,
+        year: str,
+        second_author: Optional[str],
+        context: Optional[str] = None
+    ) -> List[SearchResult]:
+        """
+        Use Claude as intelligent fallback for difficult citations.
+        
+        Claude can:
+        - Understand context (field of study)
+        - Use its training knowledge to identify works
+        - Provide structured citation data
+        """
+        results = []
+        
+        try:
+            from claude_router import guess_citation
+            
+            # Build query with context
+            if second_author:
+                query = f"{author} & {second_author} ({year})"
+            else:
+                query = f"{author} ({year})"
+            
+            # Add context hint if provided
+            if context:
+                query = f"{query}\n\nContext: This citation appears in a document about {context}."
+            
+            print(f"[AuthorDateEngine] Trying Claude for: {author} ({year})")
+            
+            guess = guess_citation(query)
+            
+            if guess.get('confidence', 0) < 0.5:
+                print(f"[AuthorDateEngine] Claude low confidence: {guess.get('confidence', 0)}")
+                return results
+            
+            # Build CitationMetadata from Claude's guess
+            from models import CitationType
+            
+            type_map = {
+                'journal': CitationType.JOURNAL,
+                'book': CitationType.BOOK,
+                'newspaper': CitationType.NEWSPAPER,
+                'medical': CitationType.MEDICAL,
+            }
+            
+            metadata = CitationMetadata(
+                citation_type=type_map.get(guess.get('type', 'journal'), CitationType.JOURNAL),
+                title=guess.get('title', ''),
+                authors=guess.get('authors', []),
+                year=guess.get('year', year),
+                journal=guess.get('journal', ''),
+                volume=guess.get('volume', ''),
+                issue=guess.get('issue', ''),
+                pages=guess.get('pages', ''),
+                publisher=guess.get('publisher', ''),
+                doi=guess.get('doi', ''),
+                source_engine="Claude AI"
+            )
+            
+            # Verify author name appears in result
+            author_lower = author.lower()
+            authors_match = any(author_lower in a.lower() for a in metadata.authors) if metadata.authors else False
+            
+            if metadata.title and authors_match:
+                confidence = guess.get('confidence', 0.7)
+                # Claude results get a small boost since they're contextual
+                results.append(SearchResult(
+                    metadata=metadata,
+                    confidence=min(0.95, confidence + 0.1),
+                    match_reason="Claude AI contextual match"
+                ))
+                print(f"[AuthorDateEngine] Claude found: {metadata.title[:50]}...")
+            else:
+                print(f"[AuthorDateEngine] Claude result didn't match author: {metadata.authors}")
+                
+        except ImportError:
+            print("[AuthorDateEngine] Claude router not available")
+        except Exception as e:
+            print(f"[AuthorDateEngine] Claude error: {e}")
         
         return results
     

@@ -122,6 +122,88 @@ class AuthorDateProcessor:
         
         return self._formatters[style]
     
+    def _detect_document_field(self, body_text: str) -> Optional[str]:
+        """
+        Detect the academic field/discipline of a document from its text.
+        
+        This helps Claude make better guesses for ambiguous citations by
+        providing context about what field the document is in.
+        
+        Returns field name like "psychology", "history", "economics", etc.
+        """
+        if not body_text:
+            return None
+        
+        text_lower = body_text.lower()
+        
+        # Field detection based on keyword frequency
+        field_keywords = {
+            'psychology': [
+                'psychology', 'psychological', 'cognitive', 'behavioral', 'behaviour',
+                'mental', 'perception', 'memory', 'learning', 'emotion', 'personality',
+                'psychologist', 'therapy', 'clinical', 'experimental', 'social psychology',
+                'developmental', 'neuroscience', 'brain', 'participants', 'subjects'
+            ],
+            'history': [
+                'history', 'historical', 'historian', 'century', 'era', 'period',
+                'war', 'revolution', 'empire', 'colonial', 'archive', 'manuscript',
+                'medieval', 'ancient', 'modern history', 'historiography'
+            ],
+            'economics': [
+                'economics', 'economic', 'economist', 'market', 'price', 'demand',
+                'supply', 'gdp', 'inflation', 'monetary', 'fiscal', 'trade',
+                'investment', 'capital', 'labor', 'wage', 'equilibrium'
+            ],
+            'sociology': [
+                'sociology', 'sociological', 'social', 'society', 'class', 'gender',
+                'race', 'inequality', 'institution', 'culture', 'community',
+                'demographic', 'population', 'urban', 'rural'
+            ],
+            'political science': [
+                'political', 'politics', 'government', 'democracy', 'election',
+                'voter', 'policy', 'legislature', 'congress', 'parliament',
+                'international relations', 'diplomacy', 'state'
+            ],
+            'medicine': [
+                'medical', 'patient', 'clinical', 'treatment', 'diagnosis',
+                'disease', 'symptom', 'therapy', 'hospital', 'physician',
+                'drug', 'pharmaceutical', 'trial', 'placebo'
+            ],
+            'biology': [
+                'biology', 'biological', 'cell', 'gene', 'dna', 'protein',
+                'organism', 'species', 'evolution', 'ecology', 'molecular'
+            ],
+            'literature': [
+                'literature', 'literary', 'novel', 'poetry', 'poem', 'fiction',
+                'narrative', 'author', 'text', 'reading', 'interpretation',
+                'criticism', 'modernism', 'postmodern'
+            ],
+            'philosophy': [
+                'philosophy', 'philosophical', 'ethics', 'moral', 'epistemology',
+                'metaphysics', 'logic', 'argument', 'reasoning', 'consciousness'
+            ]
+        }
+        
+        # Count keyword hits for each field
+        field_scores = {}
+        for field, keywords in field_keywords.items():
+            score = sum(text_lower.count(kw) for kw in keywords)
+            if score > 0:
+                field_scores[field] = score
+        
+        if not field_scores:
+            return None
+        
+        # Return field with highest score (if significantly above others)
+        best_field = max(field_scores, key=field_scores.get)
+        best_score = field_scores[best_field]
+        
+        # Only return if there's a clear winner (at least 5 hits)
+        if best_score >= 5:
+            return best_field
+        
+        return None
+    
     def process_document(
         self,
         file_bytes: bytes,
@@ -177,56 +259,89 @@ class AuthorDateProcessor:
                 errors=errors
             )
         
-        # Step 3: Look up each citation
+        # Step 3: Detect document context/field for smarter lookups
+        document_context = self._detect_document_field(body_text)
+        if document_context:
+            print(f"[AuthorDateProcessor] Detected document field: {document_context}")
+        
+        # Step 4: Look up all citations in parallel for speed
         references: List[ReferenceEntry] = []
         total = len(unique_citations)
         resolved = 0
         
-        for i, citation in enumerate(unique_citations):
-            if progress_callback:
-                pct = 20 + int((i / total) * 60)  # 20-80% for lookups
-                progress_callback(
-                    f"Looking up: {citation.author}, {citation.year}",
-                    pct, 100
-                )
-            
+        if progress_callback:
+            progress_callback("Looking up citations...", 25, 100)
+        
+        # Parallel batch lookup - much faster than sequential
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def lookup_single(citation: AuthorYearCitation) -> Tuple[AuthorYearCitation, Optional[CitationMetadata]]:
+            """Look up a single citation (runs in thread pool)."""
             try:
                 metadata = self.engine.search(
                     citation.author,
                     citation.year,
-                    citation.second_author
+                    citation.second_author,
+                    timeout=5.0,  # Shorter timeout for faster failure
+                    context=document_context  # Pass field context for smarter matching
                 )
-                
-                if metadata:
-                    # Format the reference
-                    formatter = self._get_formatter(style)
-                    formatted = formatter.format(metadata)
-                    
-                    references.append(ReferenceEntry(
-                        citation=citation,
-                        metadata=metadata,
-                        formatted=formatted,
-                        found=True,
-                        confidence=0.8  # Could get actual confidence from engine
-                    ))
-                    resolved += 1
-                else:
-                    # Not found - create placeholder
-                    references.append(ReferenceEntry(
-                        citation=citation,
-                        metadata=None,
-                        formatted=f"[NOT FOUND: {citation.author}, {citation.year}]",
-                        found=False,
-                        error="No matching publication found"
-                    ))
-            
+                return (citation, metadata)
             except Exception as e:
+                print(f"[AuthorDateProcessor] Lookup error for {citation.author} ({citation.year}): {e}")
+                return (citation, None)
+        
+        # Submit all lookups in parallel (max 8 concurrent)
+        lookup_results: Dict[AuthorYearCitation, Optional[CitationMetadata]] = {}
+        
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {
+                executor.submit(lookup_single, citation): citation 
+                for citation in unique_citations
+            }
+            
+            completed = 0
+            for future in as_completed(futures, timeout=60):  # 60s max for all
+                try:
+                    citation, metadata = future.result()
+                    lookup_results[citation] = metadata
+                    completed += 1
+                    
+                    if progress_callback:
+                        pct = 25 + int((completed / total) * 50)  # 25-75%
+                        progress_callback(
+                            f"Found {completed}/{total} references",
+                            pct, 100
+                        )
+                except Exception as e:
+                    citation = futures[future]
+                    lookup_results[citation] = None
+                    completed += 1
+        
+        # Process results in original order
+        for citation in unique_citations:
+            metadata = lookup_results.get(citation)
+            
+            if metadata:
+                # Format the reference
+                formatter = self._get_formatter(style)
+                formatted = formatter.format(metadata)
+                
+                references.append(ReferenceEntry(
+                    citation=citation,
+                    metadata=metadata,
+                    formatted=formatted,
+                    found=True,
+                    confidence=0.8  # Could get actual confidence from engine
+                ))
+                resolved += 1
+            else:
+                # Not found - create placeholder
                 references.append(ReferenceEntry(
                     citation=citation,
                     metadata=None,
-                    formatted=f"[ERROR: {citation.author}, {citation.year}]",
+                    formatted=f"[NOT FOUND: {citation.author}, {citation.year}]",
                     found=False,
-                    error=str(e)
+                    error="No matching publication found"
                 ))
         
         # Step 4: Sort references alphabetically by author
