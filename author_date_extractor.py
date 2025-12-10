@@ -27,7 +27,8 @@ class AuthorYearCitation:
     author: str          # Primary author surname (e.g., "Smith", "Bandura")
     year: str            # Publication year (e.g., "2020", "n.d.")
     is_et_al: bool = False  # True if "et al." was present
-    second_author: Optional[str] = None  # For two-author citations
+    second_author: Optional[str] = None  # For two+ author citations
+    third_author: Optional[str] = None   # For three+ author citations
     page: Optional[str] = None  # Page number if present
     raw_text: str = ""   # Original matched text
     
@@ -484,11 +485,13 @@ class AuthorDateExtractor:
                         raw_text=raw
                     )]
                 elif len(author_names) >= 3:
-                    # Three or more authors - first author et al.
+                    # Three or more authors - capture first three for better search
                     return [AuthorYearCitation(
                         author=first_author,
                         year=year,
                         is_et_al=True,
+                        second_author=author_names[1],
+                        third_author=author_names[2] if len(author_names) >= 3 else None,
                         raw_text=raw
                     )]
                 else:
@@ -535,9 +538,9 @@ class AuthorDateExtractor:
         
         return unique
     
-    def get_search_queries(self, citations: List[AuthorYearCitation] = None) -> List[Tuple[str, str, Optional[str]]]:
+    def get_search_queries(self, citations: List[AuthorYearCitation] = None) -> List[Tuple[str, str, Optional[str], Optional[str]]]:
         """
-        Return list of (author, year, second_author) tuples for searching.
+        Return list of (author, year, second_author, third_author) tuples for searching.
         
         Args:
             citations: Optional list of citations. If None, uses self.citations.
@@ -552,7 +555,8 @@ class AuthorDateExtractor:
             queries.append((
                 citation.author,
                 citation.year,
-                citation.second_author
+                citation.second_author,
+                citation.third_author
             ))
         
         return queries

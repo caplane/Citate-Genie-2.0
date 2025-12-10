@@ -100,6 +100,7 @@ class AuthorDateEngine:
         author: str,
         year: str,
         second_author: Optional[str] = None,
+        third_author: Optional[str] = None,
         timeout: float = 8.0,  # 8s is plenty without Semantic Scholar retries
         context: Optional[str] = None  # Document field/context for smarter matching
     ) -> Optional[CitationMetadata]:
@@ -109,7 +110,8 @@ class AuthorDateEngine:
         Args:
             author: Primary author surname (e.g., "Bandura")
             year: Publication year (e.g., "1977")
-            second_author: Optional second author for two-author citations
+            second_author: Optional second author for two+ author citations
+            third_author: Optional third author for three+ author citations
             timeout: Maximum time to wait for all searches
             context: Optional context (e.g., "psychology") for smarter matching
             
@@ -122,41 +124,40 @@ class AuthorDateEngine:
         
         results: List[SearchResult] = []
         
-        # Build search queries
-        query_simple = f"{author} {year}"
-        query_with_second = f"{author} {second_author} {year}" if second_author else None
+        # Build search queries - use all available authors for better disambiguation
+        authors_list = [author]
+        if second_author:
+            authors_list.append(second_author)
+        if third_author:
+            authors_list.append(third_author)
         
-        # Run searches in parallel (including Claude as another option)
-        with ThreadPoolExecutor(max_workers=4) as executor:
+        query_simple = f"{author} {year}"
+        query_with_authors = f"{' '.join(authors_list)} {year}"
+        
+        # Run searches in parallel (free/cheap engines only)
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {}
             
-            # NOTE: Semantic Scholar removed - rate limiting issues + no commercial license
-            
-            # Crossref
+            # Crossref (free)
             cr = self._get_crossref()
             if cr:
                 futures[executor.submit(
-                    self._search_crossref, author, year, second_author
+                    self._search_crossref, author, year, second_author, third_author
                 )] = "crossref"
             
-            # OpenAlex
+            # OpenAlex (free)
             oa = self._get_openalex()
             if oa:
                 futures[executor.submit(
-                    self._search_openalex, author, year, second_author
+                    self._search_openalex, author, year, second_author, third_author
                 )] = "openalex"
             
-            # Google Scholar (if available)
+            # Google Scholar via SerpAPI (paid but cheaper than Claude)
             gs = self._get_google_scholar()
             if gs:
                 futures[executor.submit(
-                    self._search_google_scholar, author, year, second_author
+                    self._search_google_scholar, author, year, second_author, third_author
                 )] = "google_scholar"
-            
-            # Claude as parallel option (not fallback)
-            futures[executor.submit(
-                self._search_claude, author, year, second_author, context
-            )] = "claude"
             
             # Collect results
             for future in as_completed(futures, timeout=timeout):
@@ -167,6 +168,41 @@ class AuthorDateEngine:
                 except Exception as e:
                     source = futures.get(future, "unknown")
                     print(f"[AuthorDateEngine] {source} error: {e}")
+        
+        # Check if we have a good result
+        if results:
+            results.sort(reverse=True)
+            best = results[0]
+            
+            # If confidence is decent, use it without calling AI
+            if best.confidence >= 0.5:
+                print(f"[AuthorDateEngine] Found {author} ({year}): {best.metadata.title[:50] if best.metadata.title else 'untitled'}... (confidence: {best.confidence:.2f})")
+                best.metadata.raw_source = f"({author}, {year})"
+                return best.metadata
+            else:
+                print(f"[AuthorDateEngine] Low confidence ({best.confidence:.2f}) for {author} ({year}), trying AI fallback...")
+        else:
+            print(f"[AuthorDateEngine] No results for {author} ({year}), trying AI fallback...")
+        
+        # TIER 2 FALLBACK: GPT-4o (~7x cheaper than Claude Opus)
+        gpt_results = self._search_gpt4o(author, year, second_author, context)
+        if gpt_results:
+            # Check if GPT-4o found something good
+            gpt_results.sort(reverse=True)
+            if gpt_results[0].confidence >= 0.5:
+                results.extend(gpt_results)
+                print(f"[AuthorDateEngine] GPT-4o success for {author} ({year})")
+            else:
+                print(f"[AuthorDateEngine] GPT-4o low confidence, trying Claude...")
+        else:
+            print(f"[AuthorDateEngine] GPT-4o failed for {author} ({year}), trying Claude...")
+        
+        # TIER 3 FALLBACK: Claude Opus (expensive, last resort)
+        # Only call Claude if GPT-4o didn't produce good results
+        if not gpt_results or (gpt_results and gpt_results[0].confidence < 0.5):
+            claude_results = self._search_claude(author, year, second_author, context)
+            if claude_results:
+                results.extend(claude_results)
         
         if not results:
             print(f"[AuthorDateEngine] No results found for {author} ({year})")
@@ -181,8 +217,6 @@ class AuthorDateEngine:
         
         # Add search info to metadata
         best.metadata.raw_source = f"({author}, {year})"
-        
-        return best.metadata
         
         return best.metadata
     
@@ -219,7 +253,8 @@ class AuthorDateEngine:
         self,
         author: str,
         year: str,
-        second_author: Optional[str]
+        second_author: Optional[str],
+        third_author: Optional[str] = None
     ) -> List[SearchResult]:
         """Search Crossref."""
         results = []
@@ -228,17 +263,20 @@ class AuthorDateEngine:
             return results
         
         try:
-            # Crossref query - author name plus year
-            query = f"{author} {year}"
+            # Crossref query - use all available authors for disambiguation
+            authors = [author]
             if second_author:
-                query = f"{author} {second_author} {year}"
+                authors.append(second_author)
+            if third_author:
+                authors.append(third_author)
+            query = f"{' '.join(authors)} {year}"
             
             metadata = cr.search(query)
             
             if metadata and metadata.title:
                 # Verify year matches
                 if metadata.year and metadata.year == year:
-                    confidence = self._calculate_confidence(metadata, author, year, second_author)
+                    confidence = self._calculate_confidence(metadata, author, year, second_author, third_author)
                     # Boost confidence if has DOI
                     if metadata.doi:
                         confidence = min(1.0, confidence + 0.1)
@@ -256,7 +294,8 @@ class AuthorDateEngine:
         self,
         author: str,
         year: str,
-        second_author: Optional[str]
+        second_author: Optional[str],
+        third_author: Optional[str] = None
     ) -> List[SearchResult]:
         """Search OpenAlex."""
         results = []
@@ -265,15 +304,18 @@ class AuthorDateEngine:
             return results
         
         try:
-            query = f"{author} {year}"
+            authors = [author]
             if second_author:
-                query = f"{author} {second_author} {year}"
+                authors.append(second_author)
+            if third_author:
+                authors.append(third_author)
+            query = f"{' '.join(authors)} {year}"
             
             metadata = oa.search(query)
             
             if metadata and metadata.title:
                 if metadata.year and metadata.year == year:
-                    confidence = self._calculate_confidence(metadata, author, year, second_author)
+                    confidence = self._calculate_confidence(metadata, author, year, second_author, third_author)
                     results.append(SearchResult(
                         metadata=metadata,
                         confidence=confidence,
@@ -288,7 +330,8 @@ class AuthorDateEngine:
         self,
         author: str,
         year: str,
-        second_author: Optional[str]
+        second_author: Optional[str],
+        third_author: Optional[str] = None
     ) -> List[SearchResult]:
         """Search Google Scholar via SERPAPI."""
         results = []
@@ -297,14 +340,18 @@ class AuthorDateEngine:
             return results
         
         try:
-            query = f"author:{author} {year}"
+            # Build author query with all available authors
+            author_parts = [f"author:{author}"]
             if second_author:
-                query = f"author:{author} author:{second_author} {year}"
+                author_parts.append(f"author:{second_author}")
+            if third_author:
+                author_parts.append(f"author:{third_author}")
+            query = f"{' '.join(author_parts)} {year}"
             
             metadata = gs.search(query)
             
             if metadata and metadata.title:
-                confidence = self._calculate_confidence(metadata, author, year, second_author)
+                confidence = self._calculate_confidence(metadata, author, year, second_author, third_author)
                 # Google Scholar often lacks DOI, slight penalty
                 if not metadata.doi:
                     confidence = max(0.0, confidence - 0.05)
@@ -323,6 +370,7 @@ class AuthorDateEngine:
         author: str,
         year: str,
         second_author: Optional[str],
+        third_author: Optional[str] = None,
         context: Optional[str] = None
     ) -> List[SearchResult]:
         """
@@ -338,17 +386,19 @@ class AuthorDateEngine:
         try:
             from claude_router import guess_citation
             
-            # Build query with context
+            # Build query with all available authors
+            authors_str = author
             if second_author:
-                query = f"{author} & {second_author} ({year})"
-            else:
-                query = f"{author} ({year})"
+                authors_str += f", {second_author}"
+            if third_author:
+                authors_str += f", & {third_author}"
+            query = f"{authors_str} ({year})"
             
             # Add context hint if provided
             if context:
                 query = f"{query}\n\nContext: This citation appears in a document about {context}."
             
-            print(f"[AuthorDateEngine] Trying Claude for: {author} ({year})")
+            print(f"[AuthorDateEngine] Trying Claude for: {authors_str} ({year})")
             
             guess = guess_citation(query)
             
@@ -403,12 +453,162 @@ class AuthorDateEngine:
         
         return results
     
+    def _search_gpt4o(
+        self,
+        author: str,
+        year: str,
+        second_author: Optional[str],
+        third_author: Optional[str] = None,
+        context: Optional[str] = None
+    ) -> List[SearchResult]:
+        """
+        Use GPT-4o as intelligent fallback for difficult citations.
+        
+        GPT-4o is ~7x cheaper than Claude Opus ($2.50/$10 vs $15/$75 per 1M tokens)
+        while still being highly capable at citation lookup.
+        
+        This is the FIRST AI fallback tier before Claude.
+        """
+        import os
+        results = []
+        
+        api_key = os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            print("[AuthorDateEngine] GPT-4o: No OPENAI_API_KEY set")
+            return results
+        
+        try:
+            import requests
+            
+            # Build query with all available authors
+            authors_str = author
+            if second_author:
+                authors_str += f", {second_author}"
+            if third_author:
+                authors_str += f", & {third_author}"
+            citation_ref = f"{authors_str} ({year})"
+            
+            context_hint = ""
+            if context:
+                context_hint = f"\n\nThis citation appears in a document about {context}."
+            
+            prompt = f"""Identify this academic citation reference: {citation_ref}{context_hint}
+
+Return a JSON object with these fields:
+- title: full title of the work
+- authors: array of author names (full names, not just surnames)
+- year: publication year
+- type: "journal", "book", or "newspaper"
+- journal: journal name (if journal article)
+- volume: volume number (if applicable)
+- issue: issue number (if applicable)
+- pages: page range (if applicable)
+- publisher: publisher name (if book)
+- doi: DOI if you know it
+- confidence: your confidence 0.0 to 1.0
+
+Only respond with valid JSON, no other text."""
+
+            print(f"[AuthorDateEngine] Trying GPT-4o for: {authors_str} ({year})")
+            
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o",
+                    "messages": [
+                        {"role": "system", "content": "You are a scholarly citation expert. Always respond with valid JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.3,
+                    "max_tokens": 500
+                },
+                timeout=10
+            )
+            
+            if response.status_code != 200:
+                print(f"[AuthorDateEngine] GPT-4o API error: {response.status_code}")
+                return results
+            
+            data = response.json()
+            content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+            
+            # Parse JSON from response
+            import json
+            # Clean up response (remove markdown code blocks if present)
+            content = content.strip()
+            if content.startswith('```'):
+                content = content.split('\n', 1)[1] if '\n' in content else content
+            if content.endswith('```'):
+                content = content.rsplit('```', 1)[0]
+            content = content.strip()
+            if content.startswith('json'):
+                content = content[4:].strip()
+            
+            guess = json.loads(content)
+            
+            if guess.get('confidence', 0) < 0.5:
+                print(f"[AuthorDateEngine] GPT-4o low confidence: {guess.get('confidence', 0)}")
+                return results
+            
+            # Build CitationMetadata from GPT-4o's guess
+            from models import CitationType
+            
+            type_map = {
+                'journal': CitationType.JOURNAL,
+                'book': CitationType.BOOK,
+                'newspaper': CitationType.NEWSPAPER,
+                'medical': CitationType.MEDICAL,
+            }
+            
+            metadata = CitationMetadata(
+                citation_type=type_map.get(guess.get('type', 'journal'), CitationType.JOURNAL),
+                title=guess.get('title', ''),
+                authors=guess.get('authors', []),
+                year=guess.get('year', year),
+                journal=guess.get('journal', ''),
+                volume=guess.get('volume', ''),
+                issue=guess.get('issue', ''),
+                pages=guess.get('pages', ''),
+                publisher=guess.get('publisher', ''),
+                doi=guess.get('doi', ''),
+                source_engine="GPT-4o"
+            )
+            
+            # Verify author name appears in result
+            author_lower = author.lower()
+            authors_match = any(author_lower in a.lower() for a in metadata.authors) if metadata.authors else False
+            
+            if metadata.title and authors_match:
+                confidence = guess.get('confidence', 0.7)
+                results.append(SearchResult(
+                    metadata=metadata,
+                    confidence=min(0.95, confidence + 0.1),
+                    match_reason="GPT-4o contextual match"
+                ))
+                print(f"[AuthorDateEngine] GPT-4o found: {metadata.title[:50]}...")
+            else:
+                print(f"[AuthorDateEngine] GPT-4o result didn't match author: {metadata.authors}")
+                
+        except ImportError as e:
+            print(f"[AuthorDateEngine] GPT-4o import error: {e}")
+        except json.JSONDecodeError as e:
+            print(f"[AuthorDateEngine] GPT-4o JSON parse error: {e}")
+        except Exception as e:
+            print(f"[AuthorDateEngine] GPT-4o error: {e}")
+        
+        return results
+    
     def _calculate_confidence(
         self,
         metadata: CitationMetadata,
         author: str,
         year: str,
-        second_author: Optional[str]
+        second_author: Optional[str],
+        third_author: Optional[str] = None
     ) -> float:
         """
         Calculate confidence score for a match.
@@ -416,7 +616,7 @@ class AuthorDateEngine:
         Factors:
         - Author name appears in authors list
         - Year matches exactly
-        - Second author matches (if provided)
+        - Second/third author matches (if provided)
         - Has DOI (more reliable)
         - Has complete metadata
         """
@@ -451,6 +651,14 @@ class AuthorDateEngine:
                     if second_lower in a:
                         confidence += 0.15
                         break
+            
+            # Check third author if provided
+            if third_author:
+                third_lower = third_author.lower()
+                for a in authors_lower:
+                    if third_lower in a:
+                        confidence += 0.1
+                        break
         
         # DOI presence (reliable identifier)
         if metadata.doi:
@@ -471,14 +679,14 @@ class AuthorDateEngine:
     
     def search_multiple(
         self,
-        citations: List[Tuple[str, str, Optional[str]]],
+        citations: List[Tuple[str, str, Optional[str], Optional[str]]],
         progress_callback=None
     ) -> Dict[Tuple[str, str], Optional[CitationMetadata]]:
         """
         Search for multiple citations.
         
         Args:
-            citations: List of (author, year, second_author) tuples
+            citations: List of (author, year, second_author, third_author) tuples
             progress_callback: Optional callback(current, total) for progress
             
         Returns:
@@ -487,14 +695,21 @@ class AuthorDateEngine:
         results = {}
         total = len(citations)
         
-        for i, (author, year, second_author) in enumerate(citations):
+        for i, citation_tuple in enumerate(citations):
             if progress_callback:
                 progress_callback(i + 1, total)
+            
+            # Handle both 3-tuple and 4-tuple formats for backward compatibility
+            if len(citation_tuple) == 4:
+                author, year, second_author, third_author = citation_tuple
+            else:
+                author, year, second_author = citation_tuple
+                third_author = None
             
             key = (author.lower(), year)
             
             try:
-                metadata = self.search(author, year, second_author)
+                metadata = self.search(author, year, second_author, third_author)
                 results[key] = metadata
             except Exception as e:
                 print(f"[AuthorDateEngine] Error searching {author}, {year}: {e}")
