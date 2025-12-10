@@ -282,7 +282,7 @@ class AuthorDateProcessor:
                     citation.author,
                     citation.year,
                     citation.second_author,
-                    timeout=5.0,  # Shorter timeout for faster failure
+                    timeout=8.0,  # 8s is plenty without Semantic Scholar retries
                     context=document_context  # Pass field context for smarter matching
                 )
                 return (citation, metadata)
@@ -290,17 +290,17 @@ class AuthorDateProcessor:
                 print(f"[AuthorDateProcessor] Lookup error for {citation.author} ({citation.year}): {e}")
                 return (citation, None)
         
-        # Submit all lookups in parallel (max 8 concurrent)
+        # Submit all lookups in parallel (max 4 concurrent to reduce rate limiting)
         lookup_results: Dict[AuthorYearCitation, Optional[CitationMetadata]] = {}
         
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
                 executor.submit(lookup_single, citation): citation 
                 for citation in unique_citations
             }
             
             completed = 0
-            for future in as_completed(futures, timeout=60):  # 60s max for all
+            for future in as_completed(futures, timeout=90):  # 90s max for all citations
                 try:
                     citation, metadata = future.result()
                     lookup_results[citation] = metadata

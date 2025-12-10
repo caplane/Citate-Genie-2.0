@@ -100,7 +100,7 @@ class AuthorDateEngine:
         author: str,
         year: str,
         second_author: Optional[str] = None,
-        timeout: float = 5.0,  # Reduced from 10s for faster processing
+        timeout: float = 8.0,  # 8s is plenty without Semantic Scholar retries
         context: Optional[str] = None  # Document field/context for smarter matching
     ) -> Optional[CitationMetadata]:
         """
@@ -126,16 +126,11 @@ class AuthorDateEngine:
         query_simple = f"{author} {year}"
         query_with_second = f"{author} {second_author} {year}" if second_author else None
         
-        # Run searches in parallel
+        # Run searches in parallel (including Claude as another option)
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {}
             
-            # Semantic Scholar
-            ss = self._get_semantic_scholar()
-            if ss:
-                futures[executor.submit(
-                    self._search_semantic_scholar, author, year, second_author
-                )] = "semantic_scholar"
+            # NOTE: Semantic Scholar removed - rate limiting issues + no commercial license
             
             # Crossref
             cr = self._get_crossref()
@@ -158,6 +153,11 @@ class AuthorDateEngine:
                     self._search_google_scholar, author, year, second_author
                 )] = "google_scholar"
             
+            # Claude as parallel option (not fallback)
+            futures[executor.submit(
+                self._search_claude, author, year, second_author, context
+            )] = "claude"
+            
             # Collect results
             for future in as_completed(futures, timeout=timeout):
                 try:
@@ -168,26 +168,8 @@ class AuthorDateEngine:
                     source = futures.get(future, "unknown")
                     print(f"[AuthorDateEngine] {source} error: {e}")
         
-        # Sort by confidence
-        if results:
-            results.sort(reverse=True)
-            best = results[0]
-            
-            # If best result is high confidence, return it
-            if best.confidence >= 0.6:
-                best.metadata.raw_source = f"({author}, {year})"
-                return best.metadata
-            
-            print(f"[AuthorDateEngine] Low confidence ({best.confidence:.2f}), trying Claude...")
-        else:
-            print(f"[AuthorDateEngine] No API results for {author} ({year}), trying Claude...")
-        
-        # Fallback: Use Claude for difficult/unfound citations
-        claude_results = self._search_claude(author, year, second_author, context)
-        if claude_results:
-            results.extend(claude_results)
-        
         if not results:
+            print(f"[AuthorDateEngine] No results found for {author} ({year})")
             return None
         
         # Sort by confidence (highest first)
@@ -195,9 +177,12 @@ class AuthorDateEngine:
         
         # Return best match
         best = results[0]
+        print(f"[AuthorDateEngine] Best match for {author} ({year}): {best.metadata.title[:50] if best.metadata.title else 'untitled'}... (confidence: {best.confidence:.2f}, source: {best.match_reason})")
         
         # Add search info to metadata
         best.metadata.raw_source = f"({author}, {year})"
+        
+        return best.metadata
         
         return best.metadata
     
