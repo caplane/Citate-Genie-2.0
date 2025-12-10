@@ -458,6 +458,202 @@ class WordDocumentProcessor:
             print(f"[WordDocumentProcessor] Error reading footnotes: {e}")
             return []
     
+    def get_body_citations(self) -> List[Dict[str, Any]]:
+        """
+        Extract APA-style author-date citations from the document body.
+        
+        Finds patterns like:
+        - Parenthetical: (Smith, 2020), (Smith & Jones, 2020), (Smith et al., 2020)
+        - Narrative: Smith (2020), Smith and Jones (2020), Smith et al. (2020)  
+        - Multiple: (Smith, 2020; Jones, 2019)
+        - With page: (Smith, 2020, p. 45)
+        - See citations: (see Smith, 2020), (see also Smith, 2020)
+        - Multiple years: (Simonton, 1992, 2000, 2002)
+        
+        Returns:
+            List of dicts with unique author-year combinations for reference generation
+        """
+        document_path = os.path.join(self.temp_dir, 'word', 'document.xml')
+        if not os.path.exists(document_path):
+            return []
+        
+        try:
+            tree = ET.parse(document_path)
+            root = tree.getroot()
+            
+            # Extract full document text
+            text_elements = root.findall('.//{%s}t' % self.NS['w'])
+            full_text = ''.join([t.text for t in text_elements if t.text])
+            
+            # Set to collect unique author-year citations
+            unique_citations = {}  # key: normalized "Author, Year" -> dict with details
+            citation_id = 0
+            
+            # Pattern 1: All parenthetical content with years (comprehensive)
+            paren_pattern = re.compile(r'\([^)]*\d{4}[a-z]?[^)]*\)')
+            
+            # Pattern 2: Narrative citations - includes multi-author before (Year)
+            # e.g., "Bernstein, Clarke-Stewart, Penner, Roy, and Wickens (2000)"
+            narrative_pattern = re.compile(
+                r'([A-Z][a-zA-Z\-]+'  # First author (may have hyphen)
+                r'(?:'
+                r'(?:\s*,\s*[A-Z][a-zA-Z\-]+)*'  # Additional comma-separated authors  
+                r'(?:\s*,?\s*(?:&|and)\s+[A-Z][a-zA-Z\-]+)?'  # Final author with &/and
+                r')?'
+                r'(?:\s+et\s+al\.)?'  # Optional et al.
+                r')\s*\((\d{4}[a-z]?)\)'
+            )
+            
+            # Find all parenthetical citations
+            for match in paren_pattern.finditer(full_text):
+                paren_text = match.group(0)
+                
+                # Skip life span dates like (1856–1939)
+                if re.match(r'^\(\d{4}[–-]\d{4}\)$', paren_text):
+                    continue
+                # Skip simple numbers like (1910) unless part of narrative
+                if re.match(r'^\(\d{4}[a-z]?\)$', paren_text):
+                    continue
+                # Skip page ranges like (pp. 45-50)
+                if re.match(r'^\(pp?\.\s*\d+', paren_text):
+                    continue
+                    
+                # Extract individual citations from multi-citation patterns
+                # Remove outer parens and "see" prefix
+                inner = paren_text[1:-1]  # Remove ( )
+                inner = re.sub(r'^see\s+(?:also\s+)?', '', inner, flags=re.IGNORECASE)
+                inner = re.sub(r'\s+for\s+(?:more\s+)?(?:recent\s+)?reviews?$', '', inner, flags=re.IGNORECASE)
+                inner = re.sub(r'\s+for\s+a\s+comprehensive\s+review$', '', inner, flags=re.IGNORECASE)
+                
+                # Split by semicolon for multiple citations
+                parts = re.split(r'\s*;\s*', inner)
+                
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    
+                    # Extract author(s) and year(s) from this citation part
+                    # Pattern handles: "Author", "Author & Author", "Author, Author, & Author"
+                    cite_match = re.match(
+                        r'^([A-Z][a-zA-Z\'\-]+'  # First author
+                        r'(?:'
+                        r'(?:\s*,\s*[A-Z][a-zA-Z\'\-]+)*'  # Additional authors with commas
+                        r'(?:\s*,?\s*&\s*[A-Z][a-zA-Z\'\-]+)?'  # Final author with &
+                        r'|'
+                        r'(?:\s+and\s+[A-Z][a-zA-Z\'\-]+)'  # Or just "and Author"
+                        r')?'
+                        r'(?:\s+et\s+al\.)?)'  # Optional et al.
+                        r',?\s*(\d{4}[a-z]?(?:\s*,\s*\d{4}[a-z]?)*)'  # Year(s)
+                        r'(?:,\s*pp?\.\s*\d+(?:[–-]\d+)?)?$',  # Optional pages
+                        part,
+                        re.IGNORECASE
+                    )
+                    
+                    if cite_match:
+                        authors = cite_match.group(1).strip()
+                        years_str = cite_match.group(2).strip()
+                        
+                        # Handle multiple years like "1992, 2000, 2002"
+                        years = re.findall(r'\d{4}[a-z]?', years_str)
+                        
+                        for year in years:
+                            # Create normalized key
+                            key = f"{authors}||{year}"
+                            if key not in unique_citations:
+                                citation_id += 1
+                                unique_citations[key] = {
+                                    'id': citation_id,
+                                    'authors': authors,
+                                    'year': year,
+                                    'text': f"({authors}, {year})",
+                                    'type': 'parenthetical',
+                                    'original_context': paren_text
+                                }
+            
+            # Find narrative citations: Author (Year)
+            for match in narrative_pattern.finditer(full_text):
+                authors = match.group(1).strip()
+                year = match.group(2).strip()
+                
+                # Skip if this is part of textbook listing (usually preceded by specific names)
+                # These appear in Methods sections describing sources
+                context_start = max(0, match.start() - 50)
+                context = full_text[context_start:match.start()]
+                
+                # Create normalized key
+                key = f"{authors}||{year}"
+                if key not in unique_citations:
+                    citation_id += 1
+                    unique_citations[key] = {
+                        'id': citation_id,
+                        'authors': authors,
+                        'year': year,
+                        'text': f"{authors} ({year})",
+                        'type': 'narrative',
+                        'original_context': match.group(0)
+                    }
+            
+            # Convert to list and sort by author, year
+            citations = sorted(
+                unique_citations.values(),
+                key=lambda x: (x['authors'].lower(), x['year'])
+            )
+            
+            # Renumber IDs after sorting
+            for i, cite in enumerate(citations, 1):
+                cite['id'] = i
+            
+            print(f"[WordDocumentProcessor] Found {len(citations)} unique author-date citations")
+            return citations
+            
+        except Exception as e:
+            print(f"[WordDocumentProcessor] Error reading body citations: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def replace_body_citation(self, citation_id: int, old_text: str, new_text: str) -> bool:
+        """
+        Replace a parenthetical citation in the document body.
+        
+        For author-date mode, this replaces the in-text citation with
+        the formatted reference (though typically author-date citations
+        stay as-is and a References section is generated).
+        
+        Args:
+            citation_id: The citation ID from get_body_citations
+            old_text: The original citation text to find
+            new_text: The replacement text
+            
+        Returns:
+            bool: True if successful
+        """
+        document_path = os.path.join(self.temp_dir, 'word', 'document.xml')
+        if not os.path.exists(document_path):
+            return False
+        
+        try:
+            with open(document_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Escape for regex
+            escaped_old = re.escape(old_text)
+            
+            # Replace first occurrence
+            new_content, count = re.subn(escaped_old, new_text, content, count=1)
+            
+            if count > 0:
+                with open(document_path, 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+                return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"[WordDocumentProcessor] Error replacing body citation: {e}")
+            return False
+    
     def write_endnote(self, note_id: str, new_content: str) -> bool:
         """
         Replace an endnote's content with new formatted citation.
