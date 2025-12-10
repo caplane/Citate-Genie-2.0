@@ -1104,6 +1104,20 @@ def health():
     })
 
 
+@app.route('/debug/env')
+def debug_env():
+    """Debug endpoint to check which API keys are configured."""
+    return jsonify({
+        'SERPAPI_KEY': 'SET ✓' if os.environ.get('SERPAPI_KEY') else 'NOT SET ✗',
+        'ANTHROPIC_API_KEY': 'SET ✓' if os.environ.get('ANTHROPIC_API_KEY') else 'NOT SET ✗',
+        'SEMANTIC_SCHOLAR_API_KEY': 'SET ✓' if os.environ.get('SEMANTIC_SCHOLAR_API_KEY') else 'NOT SET ✗',
+        'COURTLISTENER_API_KEY': 'SET ✓' if os.environ.get('CL_API_KEY') else 'NOT SET ✗',
+        'GOOGLE_CSE_API_KEY': 'SET ✓' if os.environ.get('GOOGLE_CSE_API_KEY') else 'NOT SET ✗',
+        'GEMINI_API_KEY': 'SET ✓' if os.environ.get('GEMINI_API_KEY') else 'NOT SET ✗',
+        'note': 'Values hidden for security. This only shows if keys are present.'
+    })
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
