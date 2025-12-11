@@ -9,8 +9,13 @@
     <style>
         /*
          * CiteFlex Unified - Workbench UI
-         * Version: 2.1.0
+         * Version: 2.2.0
          * Updated: 2025-12-10
+         * 
+         * V2.2.0 Changes:
+         * - Added AI-powered lookup for Author-Date citations
+         * - New /api/cite/parenthetical integration
+         * - Radio button selection for AI options
          * 
          * V2.1.0 Changes:
          * - Added mode toggle (Footnote vs Author-Date)
@@ -174,10 +179,11 @@
                     <select id="style-selector" class="flex-1 text-sm border border-gray-300 rounded-lg bg-white text-gray-700 h-9 px-3 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none cursor-pointer">
                         <!-- Footnote styles (default) -->
                         <option value="Chicago Manual of Style">Chicago (17th)</option>
-                        <option value="Bluebook">Bluebook (Legal)</option>
-                        <option value="OSCOLA">OSCOLA (UK)</option>
-                        <option value="APA">APA (7th)</option>
+                        <option value="Turabian">Turabian (9th)</option>
                         <option value="MLA">MLA (9th)</option>
+                        <option value="Vancouver">Vancouver (Medical)</option>
+                        <option value="Bluebook">Bluebook (US Legal)</option>
+                        <option value="OSCOLA">OSCOLA (UK Legal)</option>
                     </select>
                 </div>
                 
@@ -370,10 +376,29 @@
                         <h3 class="text-xs font-bold text-blue-600 uppercase mb-3 flex items-center gap-2">
                             <i class="fas fa-edit"></i> Edit Reference
                         </h3>
-                        <div class="mb-3 p-3 bg-gray-50 rounded-lg">
-                            <span class="text-xs text-gray-500">Citation:</span>
-                            <span id="preview-citation" class="text-sm font-medium text-gray-700 ml-2">(Author, Year)</span>
+                        <div class="mb-3 p-3 bg-gray-50 rounded-lg flex items-center justify-between">
+                            <div>
+                                <span class="text-xs text-gray-500">Citation:</span>
+                                <span id="preview-citation" class="text-sm font-medium text-gray-700 ml-2">(Author, Year)</span>
+                            </div>
+                            <button onclick="lookupParenthetical()" id="ai-lookup-btn" class="text-xs bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5">
+                                <i class="fas fa-magic"></i> AI Lookup
+                            </button>
                         </div>
+                        
+                        <!-- AI Options Container -->
+                        <div id="ai-options-container" class="hidden mb-4">
+                            <div class="flex items-center justify-between mb-2">
+                                <h4 class="text-xs font-bold text-purple-600 uppercase flex items-center gap-2">
+                                    <i class="fas fa-robot"></i> AI-Powered Matches
+                                </h4>
+                                <span class="text-xs text-gray-400">Select the correct work</span>
+                            </div>
+                            <div id="ai-options-list" class="space-y-2 max-h-64 overflow-y-auto">
+                                <!-- Options will be inserted here -->
+                            </div>
+                        </div>
+                        
                         <textarea id="reference-edit-area" class="w-full p-4 border border-gray-300 rounded-lg serif text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none resize-y min-h-[100px] leading-relaxed"></textarea>
                         <div class="flex gap-3 mt-4">
                             <button onclick="saveReference()" class="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-medium py-2.5 rounded-lg transition-all">
@@ -393,7 +418,7 @@
     <script>
         /*
          * CiteFlex Unified - Frontend Logic
-         * Version: 2.1.0
+         * Version: 2.2.0
          * Updated: 2025-12-10
          */
         
@@ -411,18 +436,18 @@
         // Style options for each mode
         const footnoteStyles = [
             { value: 'Chicago Manual of Style', label: 'Chicago (17th)' },
-            { value: 'Bluebook', label: 'Bluebook (Legal)' },
-            { value: 'OSCOLA', label: 'OSCOLA (UK)' },
-            { value: 'APA', label: 'APA (7th)' },
-            { value: 'MLA', label: 'MLA (9th)' }
+            { value: 'Turabian', label: 'Turabian (9th)' },
+            { value: 'MLA', label: 'MLA (9th)' },
+            { value: 'Vancouver', label: 'Vancouver (Medical)' },
+            { value: 'Bluebook', label: 'Bluebook (US Legal)' },
+            { value: 'OSCOLA', label: 'OSCOLA (UK Legal)' }
         ];
         
         const authorDateStyles = [
-            { value: 'APA', label: 'APA (7th ed.)' },
+            { value: 'APA', label: 'APA (7th)' },
             { value: 'Harvard', label: 'Harvard' },
             { value: 'Chicago Author-Date', label: 'Chicago Author-Date' },
             { value: 'ASA', label: 'ASA (Sociology)' },
-            { value: 'AAA', label: 'AAA (Anthropology)' },
             { value: 'Turabian Author-Date', label: 'Turabian Author-Date' }
         ];
 
@@ -640,7 +665,41 @@
                 
                 if (data.success) {
                     sessionId = data.session_id;
-                    currentReferences = data.references || [];
+                    
+                    // Transform citations from backend into references format for UI
+                    currentReferences = (data.citations || []).map(citation => {
+                        // Parse "(Author, Year)" or "(Author & Author2, Year)" or "(Author et al., Year)"
+                        const original = citation.original || '';
+                        const match = original.match(/\(([^,]+?)(?:\s+et\s+al\.)?(?:\s*[&,]\s*([^,]+?))?,\s*(\d{4}[a-z]?)\)/i);
+                        
+                        let author = '', secondAuthor = '', year = '', isEtAl = false;
+                        if (match) {
+                            author = match[1]?.trim() || '';
+                            secondAuthor = match[2]?.trim() || '';
+                            year = match[3] || '';
+                            isEtAl = /et\s+al/i.test(original);
+                        }
+                        
+                        // Check if AI lookup succeeded (more than just the original option)
+                        const hasOptions = citation.options && citation.options.length > 1;
+                        const formatted = citation.recommendation || 
+                                         (hasOptions ? citation.options[1]?.formatted : '') || 
+                                         original;
+                        
+                        return {
+                            id: citation.id,
+                            note_id: citation.note_id,
+                            original: original,
+                            author: author,
+                            second_author: secondAuthor,
+                            year: year,
+                            is_et_al: isEtAl,
+                            found: hasOptions,
+                            formatted: formatted,
+                            confidence: hasOptions ? 0.85 : 0,
+                            options: citation.options || []
+                        };
+                    });
                     
                     document.getElementById('citation-count').innerText = `${currentReferences.length} refs`;
                     document.getElementById('file-name-display').innerText = file.name;
@@ -648,8 +707,10 @@
                     document.getElementById('download-area').classList.remove('hidden');
                     
                     // Update stats
-                    document.getElementById('ad-resolved').textContent = data.stats.resolved;
-                    document.getElementById('ad-failed').textContent = data.stats.failed;
+                    const resolved = data.stats?.with_options || 0;
+                    const failed = data.stats?.no_options || 0;
+                    document.getElementById('ad-resolved').textContent = resolved;
+                    document.getElementById('ad-failed').textContent = failed;
                     
                     renderReferenceList();
                     renderReferenceSidebar();
@@ -788,7 +849,102 @@
         
         function closeReferencePreview() {
             document.getElementById('reference-preview').classList.add('hidden');
+            document.getElementById('ai-options-container').classList.add('hidden');
             activeRefIndex = -1;
+        }
+        
+        // ========== AI PARENTHETICAL LOOKUP ==========
+        async function lookupParenthetical() {
+            if (activeRefIndex < 0) return;
+            
+            const ref = currentReferences[activeRefIndex];
+            const btn = document.getElementById('ai-lookup-btn');
+            const container = document.getElementById('ai-options-container');
+            const list = document.getElementById('ai-options-list');
+            
+            // Build the parenthetical citation string
+            let citationText;
+            if (ref.is_et_al) {
+                citationText = `(${ref.author} et al., ${ref.year})`;
+            } else if (ref.second_author) {
+                citationText = `(${ref.author} & ${ref.second_author}, ${ref.year})`;
+            } else {
+                citationText = `(${ref.author}, ${ref.year})`;
+            }
+            
+            // Show loading state
+            const originalHtml = btn.innerHTML;
+            btn.innerHTML = '<div class="loader w-3 h-3"></div>';
+            btn.disabled = true;
+            
+            container.classList.remove('hidden');
+            list.innerHTML = `
+                <div class="flex items-center justify-center py-6 text-gray-400">
+                    <div class="loader mr-2"></div> Searching with AI...
+                </div>
+            `;
+            
+            try {
+                const res = await fetch('/api/cite/parenthetical', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        query: citationText,
+                        style: documentStyle,
+                        limit: 5
+                    })
+                });
+                
+                const data = await res.json();
+                
+                if (data.success && data.options && data.options.length > 0) {
+                    // Store options for selection
+                    window.aiOptions = data.options;
+                    
+                    // Render as radio buttons
+                    list.innerHTML = data.options.map((opt, i) => `
+                        <label class="block p-3 bg-gray-50 rounded-lg border border-gray-200 hover:border-purple-400 hover:bg-purple-50 cursor-pointer transition-all">
+                            <div class="flex items-start gap-3">
+                                <input type="radio" name="ai-option" value="${i}" onchange="selectAiOption(${i})" 
+                                       class="mt-1 w-4 h-4 text-purple-600 focus:ring-purple-500">
+                                <div class="flex-1">
+                                    <div class="flex items-center justify-between mb-1">
+                                        <span class="text-xs font-medium text-purple-700">${opt.title ? opt.title.substring(0, 60) + (opt.title.length > 60 ? '...' : '') : 'Unknown title'}</span>
+                                        <span class="text-[10px] px-1.5 py-0.5 rounded ${opt.confidence === 'high' ? 'bg-green-100 text-green-700' : opt.confidence === 'medium' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-600'}">${opt.confidence}</span>
+                                    </div>
+                                    <p class="text-sm text-gray-600 serif leading-relaxed">${opt.citation}</p>
+                                </div>
+                            </div>
+                        </label>
+                    `).join('');
+                } else {
+                    list.innerHTML = `
+                        <div class="text-center py-6 text-gray-400">
+                            <i class="fas fa-search text-2xl mb-2 opacity-30"></i>
+                            <p class="text-sm">No matches found for ${citationText}</p>
+                            <p class="text-xs mt-1">Try editing the reference manually</p>
+                        </div>
+                    `;
+                }
+            } catch (err) {
+                console.error(err);
+                list.innerHTML = `
+                    <div class="text-center py-6 text-red-400">
+                        <i class="fas fa-exclamation-circle text-2xl mb-2"></i>
+                        <p class="text-sm">AI lookup failed</p>
+                        <p class="text-xs mt-1">${err.message || 'Please try again'}</p>
+                    </div>
+                `;
+            } finally {
+                btn.innerHTML = originalHtml;
+                btn.disabled = false;
+            }
+        }
+        
+        function selectAiOption(idx) {
+            if (window.aiOptions && window.aiOptions[idx]) {
+                document.getElementById('reference-edit-area').value = window.aiOptions[idx].citation;
+            }
         }
         
         async function saveReference() {
